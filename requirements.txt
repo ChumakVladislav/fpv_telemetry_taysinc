@@ -1,0 +1,9 @@
+# Runtime dependencies for Taisync Telemetry.
+# Versions are the ones the 1.39 build was produced and tested against.
+PySide6==6.11.1
+requests==2.34.2
+pyqtgraph==0.14.0
+numpy==2.5.1
+
+# Build only (not needed to run from source):
+#   pip install pyinstaller

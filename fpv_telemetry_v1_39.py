@@ -8,9 +8,11 @@ if sys.stdout is None:
 if sys.stderr is None:
     sys.stderr = open(os.devnull, "w")
 
+import math
 import platform
 import re
 import subprocess
+import time
 import json
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -63,11 +65,48 @@ PING_INTERVAL_MS = 1500
 PING_TIMEOUT_MS = 700
 # Number of consecutive poll failures tolerated before the cards are blanked.
 ERROR_GRACE_POLLS = 3
-BASE_DIR = Path(__file__).resolve().parent
-ICON_PATH = BASE_DIR / "fpv_telemetry_icon.ico"
-LOGS_DIR = BASE_DIR / "logs"
-SETTINGS_PATH = Path.cwd() / "telemetry_settings.json"
-PING_DEBUG_PATH = Path.cwd() / "ping_debug.log"
+APP_NAME = "TaisyncTelemetry"
+FROZEN = getattr(sys, "frozen", False)
+
+if FROZEN:
+    # Directory the .exe lives in (not the temp unpack dir).
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    APP_DIR = Path(__file__).resolve().parent
+BASE_DIR = APP_DIR
+
+
+def resource_path(name: str) -> Path:
+    """Locate a bundled read-only asset (works frozen and from source)."""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidate = Path(meipass) / name
+        if candidate.exists():
+            return candidate
+    return APP_DIR / name
+
+
+def user_data_dir() -> Path:
+    """Per-user writable location for settings and logs.
+
+    Once installed under Program Files the application directory is read-only
+    and the working directory is whatever launched us, so settings and CSV logs
+    have to live somewhere the user can actually write.
+    """
+    base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base) / APP_NAME
+    return Path.home() / f".{APP_NAME.lower()}"
+
+
+DATA_DIR = user_data_dir()
+ICON_PATH = resource_path("fpv_telemetry_icon.ico")
+# Keep honouring a settings file sitting next to a source checkout so existing
+# installs do not lose their IPs; otherwise use the per-user directory.
+_LEGACY_SETTINGS = Path.cwd() / "telemetry_settings.json"
+SETTINGS_PATH = _LEGACY_SETTINGS if _LEGACY_SETTINGS.exists() else DATA_DIR / "telemetry_settings.json"
+LOGS_DIR = DATA_DIR / "logs"
+PING_DEBUG_PATH = DATA_DIR / "ping_debug.log"
 PING_DEBUG_MAX_BYTES = 256 * 1024
 RESIZE_MARGIN = 6
 MIN_W = 300
@@ -261,6 +300,7 @@ def ping_debug(line: str) -> None:
     try:
         if PING_DEBUG_PATH.exists() and PING_DEBUG_PATH.stat().st_size > PING_DEBUG_MAX_BYTES:
             return
+        PING_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with PING_DEBUG_PATH.open('a', encoding='utf-8') as f:
             f.write(line)
     except Exception:
@@ -413,6 +453,94 @@ def warning_messages(data: dict, air_latency: Optional[int], ground_latency: Opt
         msgs.append(f"BIND {safe_text(bind, 'unknown')}")
 
     return msgs[:4]
+
+
+class DemoSource:
+    """Synthetic telemetry for the TEST button.
+
+    Flies a repeating 3-minute profile: the aircraft climbs out to ~2.8 km and
+    comes back, signal and link quality degrade with distance, temperatures
+    build up, and a few errors appear at the far end of the flight. That gives
+    every card, colour threshold and warning something realistic to show
+    without any hardware attached.
+    """
+
+    PERIOD_S = 180.0
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.start = time.monotonic()
+
+    def _phase(self) -> float:
+        """0.0 at launch, 1.0 at the far point, back to 0.0 on return."""
+        elapsed = (time.monotonic() - self.start) % self.PERIOD_S
+        half = self.PERIOD_S / 2.0
+        return elapsed / half if elapsed <= half else (self.PERIOD_S - elapsed) / half
+
+    def payload(self) -> Dict[str, Any]:
+        p = self._phase()
+        t = time.monotonic() - self.start
+        jitter = 0.5 * math.sin(t * 2.3) + 0.3 * math.sin(t * 5.7)
+
+        distance = 120.0 + 2700.0 * p
+        # RSSI falls off with range; rf0 is the better antenna most of the time.
+        air_rssi0 = -58.0 - 30.0 * p + 1.5 * jitter
+        air_rssi1 = air_rssi0 - 7.0 + 2.0 * jitter
+        gnd_rssi0 = -55.0 - 29.0 * p + 1.5 * jitter
+        gnd_rssi1 = gnd_rssi0 - 6.0 + 2.0 * jitter
+
+        air_snr = 26.0 - 17.0 * p + 1.2 * jitter
+        gnd_snr = 27.0 - 16.0 * p + 1.2 * jitter
+
+        air_fail = int(max(0.0, (p ** 3) * 260.0 + 6.0 * jitter))
+        gnd_fail = int(max(0.0, (p ** 3) * 120.0 + 4.0 * jitter))
+
+        downlink = 2850.0 - 900.0 * p + 120.0 * jitter
+        uplink = 340.0 - 90.0 * p + 25.0 * jitter
+
+        air_temp = 41.0 + 22.0 * p + 0.8 * jitter
+        gnd_temp = 38.0 + 12.0 * p + 0.6 * jitter
+
+        link_up = p < 0.93          # link drops out right at the far point
+        return {
+            "airRSSI0": round(air_rssi0, 1), "airRSSI1": round(air_rssi1, 1),
+            "groundRSSI0": round(gnd_rssi0, 1), "groundRSSI1": round(gnd_rssi1, 1),
+            "airLinkStatus": "track" if link_up else "init",
+            "groundLinkStatus": "track" if link_up else "init",
+            "distance": round(distance, 1),
+            "airSnr": round(air_snr, 1), "groundSnr": round(gnd_snr, 1),
+            "airLdpcFail": air_fail, "airLdpcPass": 9800,
+            "groundLdpcFail": gnd_fail, "groundLdpcPass": 9900,
+            "airLinkQuality": f"{int(clamp(100 - 70 * p + 3 * jitter, 0, 100))}%",
+            "groundLinkQuality": f"{int(clamp(100 - 62 * p + 3 * jitter, 0, 100))}%",
+            "airAD9361Temp": round(air_temp, 1),
+            "groundAD9361Temp": round(gnd_temp, 1),
+            "airCurrentAnt": "auto rf1" if jitter >= 0 else "auto rf2",
+            "groundCurrentAnt": "auto rf2" if jitter >= 0 else "auto rf1",
+            "MCS": str(max(0, int(7 - 5 * p))),
+            "downlinkDataRate": f"{int(max(0, downlink))}kbs",
+            "uplinkDataRate": f"{int(max(0, uplink))}kbs",
+            "groundCurrentTxFreq": 5800,
+            "airTxPower": "20", "groundTxPower": "22",
+            "UAV": "online" if link_up else "offline",
+            "bindStatus": "bind",
+            "airTxOverflowCnt": int(max(0.0, (p - 0.75) * 40.0)),
+            "groundTxOverflowCnt": 0,
+            "airRxDiscardCnt": int(max(0.0, (p - 0.85) * 60.0)),
+            "groundRxDiscardCnt": 0,
+            "_demo": True,
+        }
+
+    def latency(self):
+        """Fake air/ground/rc ping values that track the flight profile."""
+        p = self._phase()
+        t = time.monotonic() - self.start
+        jitter = 0.5 * math.sin(t * 3.1)
+        air = int(clamp(8 + 300 * (p ** 2) + 6 * jitter, 1, 999))
+        ground = int(clamp(3 + 12 * p + 2 * jitter, 1, 999))
+        return air, ground, 4
 
 
 @dataclass
@@ -808,6 +936,7 @@ class TitleBar(QFrame):
     toggle_top = Signal()
     toggle_compact = Signal()
     toggle_help = Signal()
+    toggle_demo = Signal()
     open_settings = Signal()
 
     def __init__(self):
@@ -847,6 +976,7 @@ class TitleBar(QFrame):
 
         self.expand_btn = QPushButton("COMPACT")
         self.settings_btn = QPushButton("SET")
+        self.demo_btn = QPushButton("TEST")
         # HELP used to be created and then immediately hidden, so the hotkey
         # list documented in it was unreachable.
         self.help_btn = QPushButton("HELP")
@@ -854,13 +984,14 @@ class TitleBar(QFrame):
         self.snap_btn = QPushButton(">")
         self.close_btn = QPushButton("X")
 
-        for btn in [self.expand_btn, self.settings_btn, self.help_btn, self.pin_btn, self.snap_btn, self.close_btn]:
+        for btn in [self.expand_btn, self.settings_btn, self.demo_btn, self.help_btn, self.pin_btn, self.snap_btn, self.close_btn]:
             btn.setObjectName("topBtn")
             btn.setFixedHeight(28)
             layout.addWidget(btn)
 
         self.expand_btn.setToolTip("Toggle compact overlay")
         self.settings_btn.setToolTip("Ground / Air / RC IP settings")
+        self.demo_btn.setToolTip("Run simulated telemetry, no hardware needed (D)")
         self.help_btn.setToolTip("Hotkeys")
         self.pin_btn.setToolTip("Always on top (T)")
         self.snap_btn.setToolTip("Snap to right edge")
@@ -868,6 +999,7 @@ class TitleBar(QFrame):
 
         self.expand_btn.clicked.connect(self.toggle_compact.emit)
         self.settings_btn.clicked.connect(self.open_settings.emit)
+        self.demo_btn.clicked.connect(self.toggle_demo.emit)
         self.help_btn.clicked.connect(self.toggle_help.emit)
         self.pin_btn.clicked.connect(self.toggle_top.emit)
         self.snap_btn.clicked.connect(self.snap_right.emit)
@@ -1035,6 +1167,8 @@ class MainWindow(QMainWindow):
         self._quick_host_key: Any = None
         self._quick_metric_key: Any = None
         self._error_streak = 0
+        self.demo_mode = False
+        self.demo_source = DemoSource()
         self.help_dialog = None
         self.last_data = None
         self.last_state: Optional[TelemetryState] = None
@@ -1247,11 +1381,18 @@ class MainWindow(QMainWindow):
         self.title_bar.toggle_top.connect(self.toggle_topmost)
         self.title_bar.toggle_compact.connect(self.toggle_compact_view)
         self.title_bar.toggle_help.connect(self.show_help)
+        self.title_bar.toggle_demo.connect(self.toggle_demo)
         self.title_bar.open_settings.connect(self.show_settings)
+
+        # Drives the synthetic feed at the same cadence as the real poller.
+        self.demo_timer = QTimer(self)
+        self.demo_timer.setInterval(POLL_MS)
+        self.demo_timer.timeout.connect(self._demo_tick)
 
         QShortcut(QKeySequence("T"), self, activated=self.toggle_topmost)
         QShortcut(QKeySequence("L"), self, activated=self.toggle_lock)
         QShortcut(QKeySequence("R"), self, activated=self.toggle_recording)
+        QShortcut(QKeySequence("D"), self, activated=self.toggle_demo)
         QShortcut(QKeySequence("Ctrl++"), self, activated=lambda: self.adjust_scale(0.08))
         QShortcut(QKeySequence("Ctrl+="), self, activated=lambda: self.adjust_scale(0.08))
         QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self.adjust_scale(-0.08))
@@ -1268,6 +1409,7 @@ class MainWindow(QMainWindow):
         self.snap_right()
         self.title_bar.pin_btn.setText("TOP")
         self.update_rec_indicator()
+        self._update_demo_indicator()
         self.refresh_connection_labels()
         QTimer.singleShot(0, self.apply_compact_view)
 
@@ -1382,6 +1524,7 @@ class MainWindow(QMainWindow):
         self.telemetry_scroll.setVisible(not compact)
         self.title_bar.expand_btn.setVisible(not compact)
         self.title_bar.settings_btn.setVisible(not compact)
+        self.title_bar.demo_btn.setVisible(not compact)
         self.title_bar.help_btn.setVisible(not compact)
         self.title_bar.expand_btn.setText("EXPAND" if compact else "COMPACT")
         self.title_bar.pin_btn.setVisible(not compact)
@@ -1464,6 +1607,8 @@ class MainWindow(QMainWindow):
             self.on_data(self.last_data)
 
     def on_net_results(self, result: dict):
+        if self.demo_mode:
+            return
         latency = result.get("latency", {})
         hosts = result.get("hosts", {})
         self.last_air_latency = latency.get("air")
@@ -1596,7 +1741,65 @@ class MainWindow(QMainWindow):
             link_summary='TRACK' if both_track else f"AIR {air_status} / GND {ground_status}",
         )
 
+    def toggle_demo(self):
+        """Feed the UI from DemoSource instead of the radio."""
+        self.demo_mode = not self.demo_mode
+        if self.demo_mode:
+            self.demo_source.reset()
+            self.demo_timer.start()
+            self._demo_tick()
+        else:
+            self.demo_timer.stop()
+            self._error_streak = 0
+            self.last_data = None
+            self.last_air_latency = None
+            self.last_ground_latency = None
+            self.rc_online = None
+            self.fpv_online = None
+            self.update_latency_cards()
+            self.on_error("waiting for telemetry")
+        self._update_demo_indicator()
+
+    def _update_demo_indicator(self):
+        # Simulated numbers must never be mistakable for real telemetry, so the
+        # button lights up and the window title says so outright.
+        btn = self.title_bar.demo_btn
+        if self.demo_mode:
+            btn.setText("TEST ON")
+            btn.setStyleSheet(
+                "background:#5c4a1d; border:1px solid #ffd24d; border-radius:6px;"
+                " color:#ffd24d; padding:3px 7px; font-weight:800;"
+            )
+        else:
+            btn.setText("TEST")
+            btn.setStyleSheet("")
+        self._refresh_title_text()
+
+    def _refresh_title_text(self):
+        title = "Taisync Telemetry"
+        if self.demo_mode:
+            title += "  —  TEST DATA (simulated)"
+        if self.position_locked:
+            title += " [LOCK]"
+        self.title_bar.title.setText(title)
+
+    def _demo_tick(self):
+        data = self.demo_source.payload()
+        air, ground, rc = self.demo_source.latency()
+        self.last_air_latency = air
+        self.last_ground_latency = ground
+        self.rc_online = True
+        self.title_bar.set_rc_online(True)
+        self.update_latency_cards()
+        self._apply_data(data)
+
     def on_data(self, data: Dict[str, Any]):
+        # Real telemetry is ignored while the simulator is driving the UI.
+        if self.demo_mode:
+            return
+        self._apply_data(data)
+
+    def _apply_data(self, data: Dict[str, Any]):
         self.last_data = data
         self._error_streak = 0
         if hasattr(self, "view_tabs") and self.view_tabs.currentIndex() == 2:
@@ -1679,6 +1882,8 @@ class MainWindow(QMainWindow):
             self.warn_bar.hide()
 
     def on_error(self, message: str):
+        if self.demo_mode:
+            return
         self._error_streak += 1
         # A single dropped poll is normal on a wireless link. Keep the last good
         # reading on screen for a few cycles instead of flashing the whole panel
@@ -1714,6 +1919,7 @@ class MainWindow(QMainWindow):
             ("T", "Topmost on/off"),
             ("L", "Lock/unlock drag"),
             ("R", "Logger on/off"),
+            ("D", "Test data on/off (no hardware)"),
             ("Ctrl + +", "Scale up"),
             ("Ctrl + -", "Scale down"),
             ("Ctrl + 0", "Reset scale"),
@@ -1819,7 +2025,7 @@ class MainWindow(QMainWindow):
 
     def toggle_lock(self):
         self.position_locked = not self.position_locked
-        self.title_bar.title.setText("Taisync Telemetry [LOCK]" if self.position_locked else "Taisync Telemetry")
+        self._refresh_title_text()
 
     def adjust_scale(self, delta: float):
         self.scale_factor = clamp(self.scale_factor + delta, 0.8, 1.45)
@@ -2040,10 +2246,88 @@ QLabel {{ background: transparent; }}
                 card._render()
 
 
+def run_selftest(app: QApplication) -> int:
+    """Headless build check: --selftest
+
+    Packaged as a windowed .exe there is no console to print to, so the result
+    goes to a file next to the report path and into the exit code. Useful for
+    confirming a build actually works on a machine you just copied it to.
+    """
+    lines = []
+    ok = True
+
+    def check(name, fn):
+        nonlocal ok
+        try:
+            fn()
+            lines.append(f"PASS  {name}")
+        except Exception as e:
+            ok = False
+            lines.append(f"FAIL  {name}: {type(e).__name__}: {e}")
+
+    lines.append(f"Taisync Telemetry selftest  frozen={FROZEN}")
+    lines.append(f"app dir   : {APP_DIR}")
+    lines.append(f"data dir  : {DATA_DIR}")
+    lines.append(f"settings  : {SETTINGS_PATH}")
+    lines.append(f"icon      : {ICON_PATH} (exists={ICON_PATH.exists()})")
+    lines.append(f"pyqtgraph : {'yes' if pg is not None else 'MISSING'}")
+    lines.append(f"requests  : {'yes' if requests is not None else 'MISSING'}")
+    lines.append("")
+
+    win = MainWindow()
+    check("window builds", lambda: win.show())
+    check("icon present", lambda: (_ for _ in ()).throw(RuntimeError("icon missing")) if not ICON_PATH.exists() else None)
+    check("data dir writable", lambda: (DATA_DIR.mkdir(parents=True, exist_ok=True),
+                                        (DATA_DIR / ".writetest").write_text("ok", encoding="utf-8"),
+                                        (DATA_DIR / ".writetest").unlink()))
+    check("demo data feeds UI", lambda: (win.toggle_demo(), app.processEvents(),
+                                         (_ for _ in ()).throw(RuntimeError("no state"))
+                                         if win.last_state is None else None))
+
+    def tabs():
+        for i in range(win.view_tabs.count()):
+            win.view_tabs.setCurrentIndex(i)
+            app.processEvents()
+    check("all tabs render (incl. traffic chart)", tabs)
+    check("traffic chart active", lambda: (_ for _ in ()).throw(RuntimeError("pyqtgraph unavailable"))
+          if win.traffic_chart.plot_widget is None else None)
+
+    def resizes():
+        for w, h in ((1280, 900), (820, 760), (620, 700), (1280, 900)):
+            win.resize(w, h)
+            app.processEvents()
+            win._apply_responsive_layout()
+            app.processEvents()
+    check("responsive layout", resizes)
+    check("compact overlay", lambda: (win.toggle_compact_view(), app.processEvents(),
+                                      win.toggle_compact_view(), app.processEvents()))
+    win.toggle_demo()
+    win.close()
+    app.processEvents()
+
+    lines.append("")
+    lines.append("RESULT: " + ("OK" if ok else "FAILED"))
+    report = "\n".join(lines)
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        (DATA_DIR / "selftest.txt").write_text(report, encoding="utf-8")
+        lines.append(f"report written to {DATA_DIR / 'selftest.txt'}")
+    except Exception:
+        pass
+    if sys.stdout is not None:
+        try:
+            print(report)
+        except Exception:
+            pass
+    return 0 if ok else 1
+
+
 def main():
     app = QApplication(sys.argv)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
+    if "--selftest" in sys.argv:
+        sys.exit(run_selftest(app))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())
