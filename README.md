@@ -31,6 +31,27 @@ While it is on, the window title reads **TEST DATA (simulated)** and the button
 is highlighted, so simulated numbers can't be mistaken for real telemetry. Real
 telemetry is ignored until you turn it back off.
 
+## Reading the display
+
+| Card | What it shows |
+|---|---|
+| **AIR / GROUND SIGNAL** | RSSI of **both** antennas (RF1, RF2) as bars with dBm; the dot marks the active antenna. The pill shows the module's configured **TX power** (dBm and mW). The % in the title is the stronger antenna on a −95…−45 dBm scale. |
+| **AIR / GROUND QUALITY** | **T** — computed here: the worse of SNR and the FEC (LDPC) error rate over the last ~6 s. **P** — the link quality the unit reports itself. |
+| **LINK** | Modulation (MCS), channel capacity, frequency, current downlink / uplink. |
+| **CONTROL** | Bind status, SBUS / PPM frames per second, RC ping. |
+| **TEMP**, **LAT** | AD9361 transceiver temperature; ping latency to each unit. |
+
+The compact overlay (**COMPACT**) keeps both antennas and the TX power of
+each side on screen: `AIR · TX 1` over `-29 / -20`.
+
+The unit reports LDPC fails/passes, TX overflows and RX discards as totals since
+power-on. Quality and warnings use how much those totals moved recently, so a
+clean link reads 100 % however long the session, and a warning such as
+`GND TX overflow +3` clears by itself a few seconds after the overflows stop.
+
+The signal bar scale is `RSSI_MIN_DBM` / `RSSI_MAX_DBM` at the top of the
+script, if it needs tuning for a different link.
+
 ## Settings
 
 **SET** in the title bar configures the Ground / Air / RC IPs. The API URL is
@@ -84,6 +105,20 @@ the `ISCC` environment variable.
 The build is one-folder rather than one-file on purpose: a one-file build
 unpacks ~136 MB of Qt into a temp directory on every launch, which costs several
 seconds of startup and often trips antivirus heuristics.
+
+### Tests
+
+```bash
+python tests/test_telemetry.py
+```
+
+Headless regression suite (also runs under pytest). The fixture
+`tests/fixtures/live_samples.json` is a real capture from the ground unit, so
+the counter-related bugs are tested against the hardware's actual behaviour.
+`build.ps1` runs the suite first and refuses to build if anything fails.
+
+Setting `TAISYNC_OFFLINE=1` builds the UI without polling or pinging anything;
+the tests use it so live hardware on the network can't leak into them.
 
 ### Verifying a build
 

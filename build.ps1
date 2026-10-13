@@ -3,7 +3,7 @@ Builds Taisync Telemetry.
 
     .\build.ps1              # exe + portable zip
     .\build.ps1 -Installer   # also compile the Inno Setup installer
-    .\build.ps1 -SkipTest    # skip the post-build selftest
+    .\build.ps1 -SkipTest    # skip the regression tests and post-build selftest
 
 Output:
     dist\TaisyncTelemetry\TaisyncTelemetry.exe      the application
@@ -21,16 +21,38 @@ $Version = "1.39"
 
 function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 
+# Run a native tool so that its stderr (PyInstaller logs everything there) is
+# passed through as plain text. Under Windows PowerShell 5.1 with
+# $ErrorActionPreference = "Stop", stderr from a native command becomes a
+# terminating error as soon as the script's output is redirected
+# (e.g. `.\build.ps1 *> build.log`), which aborted otherwise-good builds.
+# Success is judged by $LASTEXITCODE, which this preserves.
+function Invoke-Native([scriptblock]$Command) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Command 2>&1 | ForEach-Object { "$_" }
+    } finally {
+        $ErrorActionPreference = $saved
+    }
+}
+
 Step "Checking dependencies"
-python -c "import PySide6, requests, pyqtgraph, PyInstaller" 2>$null
+Invoke-Native { python -c "import PySide6, requests, pyqtgraph, PyInstaller" } | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "Missing packages. Installing from requirements.txt..." -ForegroundColor Yellow
-    python -m pip install -r requirements.txt
-    python -m pip install pyinstaller
+    Invoke-Native { python -m pip install -r requirements.txt }
+    Invoke-Native { python -m pip install pyinstaller }
+}
+
+if (-not $SkipTest) {
+    Step "Running regression tests"
+    Invoke-Native { python tests\test_telemetry.py }
+    if ($LASTEXITCODE -ne 0) { throw "Tests FAILED - fix them before building" }
 }
 
 Step "Building the application"
-python -m PyInstaller --noconfirm --clean TaisyncTelemetry.spec
+Invoke-Native { python -m PyInstaller --noconfirm --clean TaisyncTelemetry.spec }
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 
 $exe = "dist\TaisyncTelemetry\TaisyncTelemetry.exe"
@@ -77,7 +99,7 @@ if ($Installer) {
         Write-Host "    winget install JRSoftware.InnoSetup" -ForegroundColor Yellow
         throw "ISCC.exe not available"
     }
-    & $iscc "installer.iss"
+    Invoke-Native { & $iscc "installer.iss" }
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
     $setup = "dist_installer\TaisyncTelemetry-Setup-$Version.exe"
     $setupMb = [math]::Round((Get-Item $setup).Length / 1MB, 1)

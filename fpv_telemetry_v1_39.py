@@ -31,8 +31,8 @@ try:
 except ModuleNotFoundError:
     pg = None
 
-from PySide6.QtCore import QPoint, QRect, QThread, QTimer, Qt, Signal, Slot, QObject
-from PySide6.QtGui import QGuiApplication, QKeySequence, QShortcut, QIcon, QCursor
+from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, QSize, QThread, QTimer, Qt, Signal, Slot, QObject
+from PySide6.QtGui import QColor, QGuiApplication, QKeySequence, QShortcut, QIcon, QCursor, QPainter
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -112,6 +112,19 @@ RESIZE_MARGIN = 6
 MIN_W = 300
 MIN_H = 680
 MAX_SAMPLES = 180
+# Compact overlay size. Wide enough for both antennas + TX power per side.
+COMPACT_W = 500
+COMPACT_H = 58
+# Signal bar scale. Measured on the real link: -20 dBm (air, close range) and
+# -54..-68 dBm (ground). -95 is around the receiver floor, -45 is "plenty".
+# Tune here if the bars feel too optimistic or pessimistic in the field.
+RSSI_MIN_DBM = -95.0
+RSSI_MAX_DBM = -45.0
+# FEC error rate (over the counter window) at which a warning is raised.
+LDPC_WARN_RATE_PCT = 1.0
+# Set TAISYNC_OFFLINE=1 to build the UI without polling or pinging anything.
+# Used by the test suite so live hardware on the network cannot leak into it.
+NETWORK_ENABLED = os.environ.get("TAISYNC_OFFLINE", "") != "1"
 # Resize handling is coalesced through a single-shot timer so a drag does not
 # re-run the (expensive) relayout + restyle pass on every pixel.
 RESIZE_DEBOUNCE_MS = 60
@@ -180,9 +193,15 @@ def safe_text(v: Any, default: str = "N/A") -> str:
 
 
 def best_rssi_to_percent(best_rssi: Optional[float]) -> Optional[int]:
+    """RSSI in dBm -> 0..100 %.
+
+    The old window was -94..-74 dBm, so anything stronger than -74 read 100 %.
+    On the real link (measured -20 dBm air, -54 dBm ground) both bars sat at
+    100 % and a 34 dB difference was invisible. See RSSI_MIN_DBM/RSSI_MAX_DBM.
+    """
     if best_rssi is None:
         return None
-    percent = linear_map(best_rssi, -94, -74, 0, 100)
+    percent = linear_map(best_rssi, RSSI_MIN_DBM, RSSI_MAX_DBM, 0, 100)
     return int(round(clamp(percent, 0, 100)))
 
 
@@ -193,24 +212,147 @@ def snr_to_percent(snr: Optional[float]) -> Optional[int]:
     return int(round(clamp(percent, 0, 100)))
 
 
-def ldpc_fail_to_percent(ldpc_fail: Optional[float]) -> Optional[int]:
-    if ldpc_fail is None:
+# Frame error rate (%) -> quality (%). Piecewise so that the scale spends its
+# resolution where FEC links actually live: a clean link sits well under 0.1 %,
+# and anything past a few percent is in real trouble.
+_LDPC_RATE_POINTS = ((0.0, 100), (0.1, 90), (1.0, 70), (5.0, 30), (10.0, 0))
+
+
+def ldpc_rate_to_percent(rate_pct: Optional[float]) -> Optional[int]:
+    if rate_pct is None:
         return None
-    if ldpc_fail <= 10:
+    if rate_pct <= 0:
         return 100
-    if ldpc_fail >= 100:
-        return 20
-    percent = linear_map(ldpc_fail, 10, 100, 100, 20)
-    return int(round(clamp(percent, 20, 100)))
+    for (x0, y0), (x1, y1) in zip(_LDPC_RATE_POINTS, _LDPC_RATE_POINTS[1:]):
+        if rate_pct <= x1:
+            return int(round(linear_map(rate_pct, x0, x1, y0, y1)))
+    return 0
 
 
-def combine_quality(snr: Optional[float], ldpc_fail: Optional[float]) -> Optional[int]:
-    snr_pct = snr_to_percent(snr)
-    ldpc_pct = ldpc_fail_to_percent(ldpc_fail)
-    vals = [v for v in (snr_pct, ldpc_pct) if v is not None]
+def ldpc_error_rate(fail_delta: Optional[float], pass_delta: Optional[float]) -> Optional[float]:
+    """Share of LDPC frames that failed, in percent, over a counter window.
+
+    Taisync reports airLdpcFail / airLdpcPass as totals since power-on. Earlier
+    versions fed the raw fail *total* into the quality score, so the score only
+    ever went down: past 100 lifetime failures (a 0.03 % error rate on the
+    measured link) AIR QUALITY pinned at 20 % CRIT and never recovered.
+    """
+    if fail_delta is None or pass_delta is None:
+        return None
+    frames = fail_delta + pass_delta
+    if frames <= 0:
+        return None
+    return 100.0 * fail_delta / frames
+
+
+def combine_quality(snr: Optional[float], ldpc_rate_pct: Optional[float]) -> Optional[int]:
+    """Link quality: the worse of SNR and recent FEC error rate."""
+    vals = [v for v in (snr_to_percent(snr), ldpc_rate_to_percent(ldpc_rate_pct)) if v is not None]
     if not vals:
         return None
     return min(vals)
+
+
+_MCS_RE = re.compile(r"^\s*([A-Za-z0-9]+?)_(\d+)_(\d+)\s*\(\s*([\d.]+)\s*Mbps\s*\)", re.IGNORECASE)
+
+
+def parse_mcs(value: Any) -> tuple:
+    """'16QAM_1_2(7.86Mbps)' -> ('16QAM 1/2', 7.86). Unknown formats pass through."""
+    text = safe_text(value, "")
+    m = _MCS_RE.match(text)
+    if not m:
+        return (text or "N/A", None)
+    mod, num, den, mbps = m.groups()
+    return (f"{mod.upper()} {num}/{den}", float(mbps))
+
+
+def active_antenna(value: Any) -> tuple:
+    """'auto-rf2' -> ('auto', 1). Index is 0 for RF1, 1 for RF2, None if unknown."""
+    text = safe_text(value, "").lower()
+    mode = "auto" if "auto" in text else "manual" if "man" in text else ""
+    idx = 0 if "rf1" in text else 1 if "rf2" in text else None
+    return (mode, idx)
+
+
+def nice_ceiling(value: float) -> float:
+    """Round up to 1/2/5 x 10^n for tidy chart axes."""
+    if value <= 0:
+        return 1.0
+    exp = math.floor(math.log10(value))
+    base = 10 ** exp
+    for step in (1, 2, 5, 10):
+        if value <= step * base:
+            return float(step * base)
+    return float(10 * base)
+
+
+def format_error_rate(rate_pct: Optional[float]) -> str:
+    if rate_pct is None:
+        return "--"
+    if rate_pct == 0:
+        return "0%"
+    if rate_pct < 0.01:
+        return "<0.01%"
+    if rate_pct < 1:
+        return f"{rate_pct:.2f}%"
+    return f"{rate_pct:.1f}%"
+
+
+def format_rate(per_s: Optional[float]) -> str:
+    return "--" if per_s is None else f"{per_s:.0f}/s"
+
+
+class CounterWindow:
+    """Rolling deltas of the device's since-power-on counters.
+
+    LDPC fails/passes, TX overflows, RX discards, SBUS/PPM frames are all
+    reported as running totals. What matters is how much they moved recently:
+    a historical overflow from an hour ago is not a warning now. Keeps the last
+    `window` per-poll deltas and treats a decrease as a device reboot.
+    """
+
+    def __init__(self, window: int = 5):
+        self.window = window
+        self.prev: Dict[str, float] = {}
+        self.hist: Dict[str, deque] = {}
+
+    def reset(self):
+        self.prev.clear()
+        self.hist.clear()
+
+    def update(self, data: Dict[str, Any], keys) -> None:
+        for key in keys:
+            value = parse_number(data.get(key))
+            if value is None:
+                continue
+            prev = self.prev.get(key)
+            self.prev[key] = value
+            if prev is None:
+                continue
+            delta = value - prev
+            if delta < 0:
+                # Counter went backwards: the unit rebooted. Start over.
+                self.hist[key] = deque(maxlen=self.window)
+                continue
+            self.hist.setdefault(key, deque(maxlen=self.window)).append(delta)
+
+    def recent(self, key: str) -> Optional[float]:
+        """Sum of the deltas currently in the window, None until one exists."""
+        hist = self.hist.get(key)
+        if not hist:
+            return None
+        return float(sum(hist))
+
+    def span_polls(self, key: str) -> int:
+        hist = self.hist.get(key)
+        return len(hist) if hist else 0
+
+
+COUNTER_KEYS = (
+    "airLdpcFail", "airLdpcPass", "groundLdpcFail", "groundLdpcPass",
+    "airTxOverflowCnt", "groundTxOverflowCnt", "airRxDiscardCnt", "groundRxDiscardCnt",
+    "sbusRxCnt", "ppmRxCnt",
+)
 
 
 def read_percent(*values: Any) -> Optional[int]:
@@ -392,152 +534,181 @@ def safe_int(v, default=0):
             return default
 
 
-def warning_messages(data: dict, air_latency: Optional[int], ground_latency: Optional[int], fpv_online: Optional[bool], rc_online: Optional[bool]) -> list[str]:
+def warning_messages(
+    data: dict,
+    air_latency: Optional[int],
+    ground_latency: Optional[int],
+    fpv_online: Optional[bool],
+    rc_online: Optional[bool],
+    counters: Optional["CounterWindow"] = None,
+) -> list[str]:
+    """Active warnings, most severe first.
+
+    Counter-based warnings (FEC errors, overflows, discards) look at how much
+    the counters moved over the recent window, not at their since-power-on
+    totals -- otherwise one overflow an hour ago keeps "GND overflow 8" lit for
+    the rest of the session, which is exactly what the live link showed.
+    """
     msgs = []
 
-    if fpv_online is False:
-        msgs.append("FPV unreachable")
-    if rc_online is False:
-        msgs.append("RC unreachable")
-
-    air_temp = safe_int(data.get("airAD9361Temp"), 0)
-    ground_temp = safe_int(data.get("groundAD9361Temp"), 0)
-    if air_temp > 60:
-        msgs.append(f"AIR temp high {air_temp}C")
-    elif air_temp >= 50:
-        msgs.append(f"AIR temp warm {air_temp}C")
-    if ground_temp > 60:
-        msgs.append(f"GND temp high {ground_temp}C")
-    elif ground_temp >= 50:
-        msgs.append(f"GND temp warm {ground_temp}C")
-
-    if air_latency is not None and air_latency > 250:
-        msgs.append(f"AIR latency high {air_latency} ms")
-    elif air_latency is not None and air_latency >= 100:
-        msgs.append(f"AIR latency medium {air_latency} ms")
-    if ground_latency is not None and ground_latency > 250:
-        msgs.append(f"GND latency high {ground_latency} ms")
-    elif ground_latency is not None and ground_latency >= 100:
-        msgs.append(f"GND latency medium {ground_latency} ms")
-
-    air_fail = safe_int(data.get("airLdpcFail"), 0)
-    air_pass = safe_int(data.get("airLdpcPass"), 0)
-    ground_fail = safe_int(data.get("groundLdpcFail"), 0)
-    ground_pass = safe_int(data.get("groundLdpcPass"), 0)
-    air_total = air_fail + air_pass
-    ground_total = ground_fail + ground_pass
-    air_fail_pct = (100.0 * air_fail / air_total) if air_total > 0 else 0.0
-    ground_fail_pct = (100.0 * ground_fail / ground_total) if ground_total > 0 else 0.0
-    if air_fail_pct >= 1.0:
-        msgs.append(f"AIR LDPC fail {air_fail_pct:.2f}%")
-    if ground_fail_pct >= 1.0:
-        msgs.append(f"GND LDPC fail {ground_fail_pct:.2f}%")
-
-    if safe_int(data.get("airTxOverflowCnt"), 0) > 0:
-        msgs.append(f"AIR overflow {safe_int(data.get('airTxOverflowCnt'), 0)}")
-    if safe_int(data.get("groundTxOverflowCnt"), 0) > 0:
-        msgs.append(f"GND overflow {safe_int(data.get('groundTxOverflowCnt'), 0)}")
-    if safe_int(data.get("airRxDiscardCnt"), 0) > 0:
-        msgs.append(f"AIR discard {safe_int(data.get('airRxDiscardCnt'), 0)}")
-    if safe_int(data.get("groundRxDiscardCnt"), 0) > 0:
-        msgs.append(f"GND discard {safe_int(data.get('groundRxDiscardCnt'), 0)}")
-
-    # Only complain about these when the payload actually carries them. The old
-    # code compared a missing key against "" and therefore appended a bogus
-    # "UAV" / "BIND" warning on every single poll.
+    # 1. Link / control. `fpv_online` is derived from the same UAV field, so
+    #    only report it once.
     uav = data.get("UAV")
     if uav is not None and str(uav).strip().lower() not in ("online", "ok"):
         msgs.append(f"UAV {safe_text(uav, 'unknown')}")
+    elif uav is None and fpv_online is False:
+        msgs.append("FPV unreachable")
     bind = data.get("bindStatus")
     if bind is not None and str(bind).strip().lower() not in ("bind", "bound", "ok"):
         msgs.append(f"BIND {safe_text(bind, 'unknown')}")
+    if rc_online is False:
+        msgs.append("RC unreachable")
 
-    return msgs[:4]
+    # 2. Data integrity, from counter deltas.
+    if counters is not None:
+        for side, label in (("air", "AIR"), ("ground", "GND")):
+            rate = ldpc_error_rate(counters.recent(f"{side}LdpcFail"), counters.recent(f"{side}LdpcPass"))
+            if rate is not None and rate >= LDPC_WARN_RATE_PCT:
+                msgs.append(f"{label} FEC errors {rate:.1f}%")
+        for key, label in (
+            ("airTxOverflowCnt", "AIR TX overflow"),
+            ("groundTxOverflowCnt", "GND TX overflow"),
+            ("airRxDiscardCnt", "AIR RX discard"),
+            ("groundRxDiscardCnt", "GND RX discard"),
+        ):
+            moved = counters.recent(key)
+            if moved:
+                msgs.append(f"{label} +{int(moved)}")
+
+    # 3. Thermal.
+    for key, label in (("airAD9361Temp", "AIR"), ("groundAD9361Temp", "GND")):
+        temp = parse_number(data.get(key))
+        if temp is None:
+            continue
+        if temp > 60:
+            msgs.append(f"{label} temp high {temp:.0f}C")
+        elif temp >= 50:
+            msgs.append(f"{label} temp warm {temp:.0f}C")
+
+    # 4. Latency.
+    for latency, label in ((air_latency, "AIR"), (ground_latency, "GND")):
+        if latency is None:
+            continue
+        if latency > 250:
+            msgs.append(f"{label} latency high {latency} ms")
+        elif latency >= 100:
+            msgs.append(f"{label} latency {latency} ms")
+
+    return msgs[:6]
 
 
 class DemoSource:
     """Synthetic telemetry for the TEST button.
 
-    Flies a repeating 3-minute profile: the aircraft climbs out to ~2.8 km and
-    comes back, signal and link quality degrade with distance, temperatures
-    build up, and a few errors appear at the far end of the flight. That gives
-    every card, colour threshold and warning something realistic to show
-    without any hardware attached.
+    Shaped after a payload captured from the real ground unit (1410 MHz link,
+    55 fields): the same keys, the same value formats, and -- importantly --
+    the same *cumulative* counters. LDPC fails/passes, overflows and discards
+    only ever grow, exactly like the hardware, so the simulator exercises the
+    delta logic rather than hiding bugs in it.
+
+    Flies a repeating 3-minute profile out to ~2.8 km and back: RSSI and SNR
+    fall off with range, the FEC error rate climbs, temperatures build, the
+    MCS steps down, and the link drops to "init" at the turnaround.
     """
 
     PERIOD_S = 180.0
+    _MCS_STEPS = (
+        (0.30, "64QAM_2_3(13.1Mbps)"),
+        (0.60, "16QAM_1_2(7.86Mbps)"),
+        (0.85, "QPSK_1_2(3.93Mbps)"),
+        (1.01, "BPSK_1_2(1.97Mbps)"),
+    )
 
     def __init__(self):
         self.reset()
 
     def reset(self):
         self.start = time.monotonic()
+        self._last = self.start
+        self.totals = {
+            "airLdpcFail": 0.0, "airLdpcPass": 0.0,
+            "groundLdpcFail": 0.0, "groundLdpcPass": 0.0,
+            "airTxOverflowCnt": 0.0, "groundTxOverflowCnt": 0.0,
+            "airRxDiscardCnt": 0.0, "groundRxDiscardCnt": 0.0,
+            "sbusRxCnt": 0.0, "ppmRxCnt": 0.0,
+        }
 
-    def _phase(self) -> float:
+    def _phase(self, now: float) -> float:
         """0.0 at launch, 1.0 at the far point, back to 0.0 on return."""
-        elapsed = (time.monotonic() - self.start) % self.PERIOD_S
+        elapsed = (now - self.start) % self.PERIOD_S
         half = self.PERIOD_S / 2.0
         return elapsed / half if elapsed <= half else (self.PERIOD_S - elapsed) / half
 
     def payload(self) -> Dict[str, Any]:
-        p = self._phase()
-        t = time.monotonic() - self.start
+        now = time.monotonic()
+        dt = max(0.0, min(5.0, now - self._last))
+        self._last = now
+        p = self._phase(now)
+        t = now - self.start
         jitter = 0.5 * math.sin(t * 2.3) + 0.3 * math.sin(t * 5.7)
+        link_up = p < 0.93
 
-        distance = 120.0 + 2700.0 * p
-        # RSSI falls off with range; rf0 is the better antenna most of the time.
-        air_rssi0 = -58.0 - 30.0 * p + 1.5 * jitter
-        air_rssi1 = air_rssi0 - 7.0 + 2.0 * jitter
-        gnd_rssi0 = -55.0 - 29.0 * p + 1.5 * jitter
-        gnd_rssi1 = gnd_rssi0 - 6.0 + 2.0 * jitter
+        # Frame counters advance at roughly the rates seen on the real unit
+        # (~370 air / ~5000 ground LDPC frames per second), with an error rate
+        # that is negligible close in and several percent at the far point.
+        err = clamp(0.00002 + 0.07 * (p ** 4) + 0.004 * max(0.0, jitter), 0.0, 0.5)
+        for side, fps in (("air", 370.0), ("ground", 5000.0)):
+            frames = fps * dt if link_up else 0.0
+            self.totals[f"{side}LdpcFail"] += frames * err
+            self.totals[f"{side}LdpcPass"] += frames * (1.0 - err)
+        if p > 0.8:
+            self.totals["airTxOverflowCnt"] += dt * 2.0
+        if p > 0.88:
+            self.totals["groundRxDiscardCnt"] += dt * 3.0
+        if link_up:
+            self.totals["sbusRxCnt"] += dt * 70.0
 
-        air_snr = 26.0 - 17.0 * p + 1.2 * jitter
-        gnd_snr = 27.0 - 16.0 * p + 1.2 * jitter
+        air_rssi0 = -24.0 - 64.0 * p + 1.5 * jitter
+        air_rssi1 = air_rssi0 + (5.0 if jitter > 0 else -6.0)
+        gnd_rssi0 = -50.0 - 40.0 * p + 1.5 * jitter
+        gnd_rssi1 = gnd_rssi0 - 9.0 + 2.0 * jitter
+        mcs = next(text for limit, text in self._MCS_STEPS if p < limit)
+        downlink = 600.0 - 380.0 * p + 60.0 * jitter
+        uplink = 1.0 + 2.0 * max(0.0, jitter)
 
-        air_fail = int(max(0.0, (p ** 3) * 260.0 + 6.0 * jitter))
-        gnd_fail = int(max(0.0, (p ** 3) * 120.0 + 4.0 * jitter))
-
-        downlink = 2850.0 - 900.0 * p + 120.0 * jitter
-        uplink = 340.0 - 90.0 * p + 25.0 * jitter
-
-        air_temp = 41.0 + 22.0 * p + 0.8 * jitter
-        gnd_temp = 38.0 + 12.0 * p + 0.6 * jitter
-
-        link_up = p < 0.93          # link drops out right at the far point
-        return {
-            "airRSSI0": round(air_rssi0, 1), "airRSSI1": round(air_rssi1, 1),
-            "groundRSSI0": round(gnd_rssi0, 1), "groundRSSI1": round(gnd_rssi1, 1),
-            "airLinkStatus": "track" if link_up else "init",
-            "groundLinkStatus": "track" if link_up else "init",
-            "distance": round(distance, 1),
-            "airSnr": round(air_snr, 1), "groundSnr": round(gnd_snr, 1),
-            "airLdpcFail": air_fail, "airLdpcPass": 9800,
-            "groundLdpcFail": gnd_fail, "groundLdpcPass": 9900,
-            "airLinkQuality": f"{int(clamp(100 - 70 * p + 3 * jitter, 0, 100))}%",
-            "groundLinkQuality": f"{int(clamp(100 - 62 * p + 3 * jitter, 0, 100))}%",
-            "airAD9361Temp": round(air_temp, 1),
-            "groundAD9361Temp": round(gnd_temp, 1),
-            "airCurrentAnt": "auto rf1" if jitter >= 0 else "auto rf2",
-            "groundCurrentAnt": "auto rf2" if jitter >= 0 else "auto rf1",
-            "MCS": str(max(0, int(7 - 5 * p))),
-            "downlinkDataRate": f"{int(max(0, downlink))}kbs",
-            "uplinkDataRate": f"{int(max(0, uplink))}kbs",
-            "groundCurrentTxFreq": 5800,
-            "airTxPower": "20", "groundTxPower": "22",
+        payload = {
+            "CurRxFreq": 1410, "CurTxFreq": 1410,
+            "groundCurrentRxFreq": 1410, "groundCurrentTxFreq": 1410,
+            "MCS": mcs,
             "UAV": "online" if link_up else "offline",
             "bindStatus": "bind",
-            "airTxOverflowCnt": int(max(0.0, (p - 0.75) * 40.0)),
-            "groundTxOverflowCnt": 0,
-            "airRxDiscardCnt": int(max(0.0, (p - 0.85) * 60.0)),
-            "groundRxDiscardCnt": 0,
+            "airLinkStatus": "track" if link_up else "init",
+            "groundLinkStatus": "track" if link_up else "init",
+            "airRSSI0": int(round(air_rssi0)), "airRSSI1": int(round(air_rssi1)),
+            "groundRSSI0": int(round(gnd_rssi0)), "groundRSSI1": int(round(gnd_rssi1)),
+            "airSnr": int(round(clamp(25.0 - 17.0 * p + jitter, 0, 40))),
+            "groundSnr": int(round(clamp(29.0 - 18.0 * p + jitter, 0, 40))),
+            "airLinkQuality": f"{int(clamp(100 - 70 * p + 3 * jitter, 0, 100))}%",
+            "groundLinkQuality": f"{int(clamp(100 - 62 * p + 3 * jitter, 0, 100))}%",
+            "airAD9361Temp": int(round(36 + 26.0 * p)),
+            "groundAD9361Temp": int(round(43 + 9.0 * p)),
+            "airFPGATemp": 0, "groundFPGATemp": 0,
+            "airCurrentAnt": "auto-rf2" if air_rssi1 >= air_rssi0 else "auto-rf1",
+            "groundCurrentAnt": "auto-rf1" if gnd_rssi0 >= gnd_rssi1 else "auto-rf2",
+            "airTxPower": 1, "groundTxPower": 27,
+            "distance": int(round(2700.0 * p)),
+            "downlinkDataRate": f"{int(max(0, downlink))}kbs",
+            "uplinkDataRate": f"{int(max(0, uplink))}kbs",
             "_demo": True,
         }
+        payload.update({k: int(v) for k, v in self.totals.items()})
+        return payload
 
     def latency(self):
         """Fake air/ground/rc ping values that track the flight profile."""
-        p = self._phase()
-        t = time.monotonic() - self.start
-        jitter = 0.5 * math.sin(t * 3.1)
+        now = time.monotonic()
+        p = self._phase(now)
+        jitter = 0.5 * math.sin((now - self.start) * 3.1)
         air = int(clamp(8 + 300 * (p ** 2) + 6 * jitter, 1, 999))
         ground = int(clamp(3 + 12 * p + 2 * jitter, 1, 999))
         return air, ground, 4
@@ -575,6 +746,29 @@ class TelemetryState:
     downlink_kbs: Optional[float] = None
     link_summary: str = "NO DATA"
     last_error: str = ""
+    # Per-antenna RSSI, so both RF chains are visible rather than just the best.
+    air_rssi0: Optional[float] = None
+    air_rssi1: Optional[float] = None
+    ground_rssi0: Optional[float] = None
+    ground_rssi1: Optional[float] = None
+    air_ant_mode: str = ""
+    ground_ant_mode: str = ""
+    air_ant_index: Optional[int] = None
+    ground_ant_index: Optional[int] = None
+    # Module output power in dBm, as configured on the unit.
+    air_tx_dbm: Optional[float] = None
+    ground_tx_dbm: Optional[float] = None
+    # FEC frame error rate (%) over the recent counter window.
+    air_ldpc_rate: Optional[float] = None
+    ground_ldpc_rate: Optional[float] = None
+    mcs_mode: str = "N/A"
+    mcs_mbps: Optional[float] = None
+    freq_mhz: Optional[float] = None
+    air_temp_c: Optional[float] = None
+    ground_temp_c: Optional[float] = None
+    sbus_per_s: Optional[float] = None
+    ppm_per_s: Optional[float] = None
+    bind_status: str = "N/A"
 
 
 class SettingsDialog(QDialog):
@@ -929,6 +1123,197 @@ class MetricCard(QFrame):
         self._render()
 
 
+def elide_into(label: QLabel, text: str) -> None:
+    """Set `text` on `label`, eliding to its width; full text goes to the tooltip."""
+    width = label.width()
+    metrics = label.fontMetrics()
+    if width <= 2 or metrics.horizontalAdvance(text) <= width:
+        label.setToolTip("")
+        label.setText(text)
+        return
+    label.setToolTip(text)
+    label.setText(metrics.elidedText(text, Qt.ElideRight, width))
+
+
+def dbm_to_mw(dbm: Optional[float]) -> Optional[float]:
+    return None if dbm is None else 10 ** (dbm / 10.0)
+
+
+def format_tx_power(dbm: Optional[float]) -> str:
+    if dbm is None:
+        return "TX --"
+    mw = dbm_to_mw(dbm)
+    mw_text = f"{mw:.1f}" if mw < 10 else f"{mw:.0f}"
+    return f"TX {dbm:g} dBm · {mw_text} mW"
+
+
+class AntennaBar(QWidget):
+    """One RF chain: label, a level bar scaled like the signal %, and dBm.
+
+    Painted by hand rather than built from QProgressBar + labels: there are
+    four of these updating every poll, and a single paintEvent that only runs
+    when the value actually changes is far cheaper than restyling widgets.
+    """
+
+    def __init__(self, label: str):
+        super().__init__()
+        self.setObjectName("antBar")
+        self.label = label
+        self.dbm: Optional[float] = None
+        self.active = False
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_state(self, dbm: Optional[float], active: bool):
+        if dbm == self.dbm and active == self.active:
+            return
+        self.dbm = dbm
+        self.active = active
+        value = "--" if dbm is None else f"{dbm:.0f} dBm"
+        self.setToolTip(f"{self.label}: {value}" + ("  (active antenna)" if active else ""))
+        self.update()
+
+    def sizeHint(self):
+        return QSize(220, self.fontMetrics().height() + 8)
+
+    def minimumSizeHint(self):
+        return QSize(120, self.fontMetrics().height() + 6)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.FontChange:
+            self.updateGeometry()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        fm = painter.fontMetrics()
+        pct = best_rssi_to_percent(self.dbm)
+        color = QColor(signal_color(pct))
+
+        dot = max(6, fm.height() // 3)
+        label_x = dot + 6
+        label_w = fm.horizontalAdvance("RF2") + 8
+        value_font = painter.font()
+        value_font.setBold(True)
+        value_w = fm.horizontalAdvance("-100 dBm") + 10
+
+        if self.active:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(QRectF(0, (h - dot) / 2.0, dot, dot))
+        painter.setPen(QColor("#eaf2f8" if self.active else "#8ea1b2"))
+        painter.drawText(QRectF(label_x, 0, label_w, h), int(Qt.AlignVCenter | Qt.AlignLeft), self.label)
+
+        bar_x = label_x + label_w
+        bar_w = max(10.0, w - bar_x - value_w)
+        bar_h = max(6.0, round(h * 0.42))
+        bar_y = (h - bar_h) / 2.0
+        radius = bar_h / 2.0
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#0c1116"))
+        painter.drawRoundedRect(QRectF(bar_x, bar_y, bar_w, bar_h), radius, radius)
+        if pct:
+            fill_w = max(bar_h, bar_w * pct / 100.0)
+            painter.setBrush(color)
+            painter.drawRoundedRect(QRectF(bar_x, bar_y, fill_w, bar_h), radius, radius)
+
+        painter.setFont(value_font)
+        painter.setPen(color)
+        text = "--" if self.dbm is None else f"{self.dbm:.0f} dBm"
+        painter.drawText(QRectF(w - value_w, 0, value_w, h), int(Qt.AlignVCenter | Qt.AlignRight), text)
+        painter.end()
+
+
+class SignalCard(QFrame):
+    """Signal tile for one side of the link: both antennas plus TX power.
+
+    Replaces the old "best RSSI as a percentage" card, which only ever showed
+    the stronger chain and saturated at 100 %, and the separate ANTENNA card,
+    whose content (which chain is active) now lives on the bars themselves.
+    """
+
+    def __init__(self, title: str):
+        super().__init__()
+        self.setObjectName("card")
+        self._base_title = title
+        self._compact = False
+        self._title_text = title
+        self._detail_text = ""
+        self._tx_text = "TX --"
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
+        layout.addStretch(1)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.title = QLabel(title)
+        self.title.setObjectName("cardTitle")
+        self.title.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        header.addWidget(self.title, 1)
+        self.tx = QLabel(self._tx_text)
+        self.tx.setObjectName("txPill")
+        self.tx.setToolTip("Configured module output power")
+        header.addWidget(self.tx, 0, Qt.AlignRight)
+        layout.addLayout(header)
+
+        self.bars = [AntennaBar("RF1"), AntennaBar("RF2")]
+        for bar in self.bars:
+            layout.addWidget(bar)
+
+        self.detail = QLabel("")
+        self.detail.setObjectName("cardDetail")
+        self.detail.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        layout.addWidget(self.detail)
+        layout.addStretch(1)
+
+    def update_data(self, pct, rssi0, rssi1, active_index, mode, tx_dbm, note: str = ""):
+        self.bars[0].set_state(rssi0, active_index == 0)
+        self.bars[1].set_state(rssi1, active_index == 1)
+        title = self._base_title if pct is None else f"{self._base_title} • {pct}%"
+        tx_text = format_tx_power(tx_dbm)
+        parts = []
+        if note:
+            parts.append(note)
+        else:
+            if mode:
+                parts.append(mode)
+            if active_index is not None:
+                parts.append(f"active RF{active_index + 1}")
+            if rssi0 is not None and rssi1 is not None:
+                parts.append(f"RF1-RF2 {rssi0 - rssi1:+.0f} dB")
+        detail = " · ".join(parts)
+        if (title, detail, tx_text) != (self._title_text, self._detail_text, self._tx_text):
+            self._title_text, self._detail_text, self._tx_text = title, detail, tx_text
+            self.tx.setText(tx_text)
+            self._render()
+
+    def set_compact(self, compact: bool):
+        if compact == self._compact:
+            return
+        self._compact = compact
+        self.detail.setVisible(not compact)
+
+    def set_value_font_px(self, px):
+        pass
+
+    def setMinimumHeight(self, height: int):
+        # Never let the responsive layout squeeze the two bars together.
+        layout = self.layout()
+        floor = layout.minimumSize().height() if layout is not None else 0
+        super().setMinimumHeight(max(height, floor))
+
+    def _render(self):
+        elide_into(self.title, self._title_text)
+        elide_into(self.detail, self._detail_text)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._render()
+
+
 class TitleBar(QFrame):
     drag_started = Signal(QPoint)
     drag_moved = Signal(QPoint)
@@ -1038,20 +1423,41 @@ class TitleBar(QFrame):
 
 
 class TrafficChart(QWidget):
-    LIMIT_KBS = 3000  # ~3 Mb/s
+    """Downlink (left axis) and uplink (right axis) over the last few minutes.
+
+    Both axes auto-scale independently. The old fixed 0..3000 kb/s range put
+    the real link's 215-604 kb/s downlink in the bottom fifth of the plot and
+    its ~1 kb/s uplink flat on the axis, and drew a "3 Mb/s limit" line that
+    had nothing to do with the actual channel. Capacity now comes from the MCS
+    the unit reports and is shown as utilisation in the stats line.
+    """
+
+    DOWN_FLOOR_KBS = 50.0
+    UP_FLOOR_KBS = 5.0
 
     def __init__(self):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
         self.max_samples = MAX_SAMPLES
         self.uplink_history = deque(maxlen=MAX_SAMPLES)
         self.downlink_history = deque(maxlen=MAX_SAMPLES)
+        self.capacity_mbps: Optional[float] = None
+        self.mcs_mode = ""
         self._dirty = False
         self._x_cache: list = []
+        self._down_top: Optional[float] = None
+        self._up_top: Optional[float] = None
+        self._painted_stats: Optional[str] = None
+
+        self.stats = QLabel("Waiting for traffic...")
+        self.stats.setObjectName("chartStats")
+        self.stats.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        layout.addWidget(self.stats)
 
         if pg is None:
-            placeholder = QLabel("pyqtgraph \u043d\u0435 \u0432\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u043e \u2014 \u0433\u0440\u0430\u0444\u0456\u043a \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0438\u0439")
+            placeholder = QLabel("pyqtgraph не встановлено — графік недоступний")
             placeholder.setAlignment(Qt.AlignCenter)
             placeholder.setStyleSheet("color: #ff5c5c; font-size: 14px;")
             layout.addWidget(placeholder)
@@ -1064,22 +1470,26 @@ class TrafficChart(QWidget):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.showGrid(x=True, y=True, alpha=0.2)
         self.plot_widget.setLabel("left", "Downlink (kb/s)", color="#5bc8ff")
-        self.plot_widget.setLabel("bottom", "Samples")
-        self.plot_widget.setYRange(0, self.LIMIT_KBS)
+        self.plot_widget.setLabel("bottom", "seconds (0 = now)")
+        self.plot_widget.setMouseEnabled(x=False, y=False)
+        self.plot_widget.hideButtons()
+        plot_item = self.plot_widget.getPlotItem()
+        plot_item.vb.disableAutoRange()
 
-        legend = self.plot_widget.addLegend()
+        legend = self.plot_widget.addLegend(offset=(10, 10))
 
         self.downlink_curve = self.plot_widget.plot(
             [], [], pen=pg.mkPen("#5bc8ff", width=2), name="Downlink"
         )
 
         self.right_axis = pg.ViewBox()
+        self.right_axis.disableAutoRange()
+        self.right_axis.setMouseEnabled(x=False, y=False)
         self.plot_widget.scene().addItem(self.right_axis)
         self.plot_widget.getAxis("right").linkToView(self.right_axis)
-        self.right_axis.setXLink(self.plot_widget.getPlotItem().vb)
+        self.right_axis.setXLink(plot_item.vb)
         self.plot_widget.showAxis("right")
         self.plot_widget.getAxis("right").setLabel("Uplink (kb/s)", color="#f1c40f")
-        self.right_axis.setYRange(0, self.LIMIT_KBS)
 
         self.uplink_curve = pg.PlotDataItem(
             [], [], pen=pg.mkPen("#f1c40f", width=2), name="Uplink"
@@ -1087,24 +1497,22 @@ class TrafficChart(QWidget):
         self.right_axis.addItem(self.uplink_curve)
         legend.addItem(self.uplink_curve, "Uplink")
 
-        limit_line = pg.InfiniteLine(
-            pos=self.LIMIT_KBS, angle=0,
-            pen=pg.mkPen("#ff5c5c", width=1, style=Qt.DashLine)
-        )
-        self.plot_widget.addItem(limit_line)
+        plot_item.vb.sigResized.connect(self._sync_right_axis)
+        self._apply_ranges(self.DOWN_FLOOR_KBS, self.UP_FLOOR_KBS)
+        self._apply_x_range()
 
-        self.plot_widget.getPlotItem().vb.sigResized.connect(self._sync_right_axis)
-
-        layout.addWidget(self.plot_widget)
+        layout.addWidget(self.plot_widget, 1)
 
     def _sync_right_axis(self):
         if self.plot_widget is None:
             return
         self.right_axis.setGeometry(self.plot_widget.getPlotItem().vb.sceneBoundingRect())
 
+    def set_link(self, mcs_mode: str, capacity_mbps: Optional[float]):
+        self.mcs_mode = mcs_mode or ""
+        self.capacity_mbps = capacity_mbps
+
     def add_sample(self, uplink_kbs, downlink_kbs):
-        if self.plot_widget is None:
-            return
         self.uplink_history.append(uplink_kbs or 0)
         self.downlink_history.append(downlink_kbs or 0)
         self._dirty = True
@@ -1113,18 +1521,70 @@ class TrafficChart(QWidget):
         if self.isVisible():
             self._flush()
 
+    @staticmethod
+    def _next_top(current: Optional[float], peak: float, floor: float) -> float:
+        """Axis top with headroom; grows at once, shrinks only when far too big."""
+        wanted = nice_ceiling(max(floor, peak * 1.2))
+        if current is None or wanted > current or wanted * 2.5 < current:
+            return wanted
+        return current
+
+    def _apply_ranges(self, down_top: float, up_top: float):
+        if self.plot_widget is None:
+            return
+        if down_top != self._down_top:
+            self._down_top = down_top
+            self.plot_widget.getPlotItem().vb.setYRange(0, down_top, padding=0)
+        if up_top != self._up_top:
+            self._up_top = up_top
+            self.right_axis.setYRange(0, up_top, padding=0)
+
+    def _apply_x_range(self):
+        span = (self.max_samples - 1) * POLL_MS / 1000.0
+        self.plot_widget.getPlotItem().vb.setXRange(-span, 0, padding=0)
+
+    def _stats_text(self) -> str:
+        if not self.downlink_history:
+            return "Waiting for traffic..."
+        down_now = self.downlink_history[-1]
+        up_now = self.uplink_history[-1]
+        down_peak = max(self.downlink_history)
+        text = f"Downlink {down_now:.0f} kb/s (peak {down_peak:.0f})   Uplink {up_now:.0f} kb/s"
+        if self.capacity_mbps:
+            used = 100.0 * down_now / (self.capacity_mbps * 1000.0)
+            text += f"   |   {self.mcs_mode} capacity {self.capacity_mbps:g} Mb/s, {used:.0f}% used"
+        return text
+
     def _flush(self):
+        stats = self._stats_text()
+        if stats != self._painted_stats:
+            self._painted_stats = stats
+            elide_into(self.stats, stats)
         if self.plot_widget is None or not self._dirty:
             return
         self._dirty = False
         count = len(self.uplink_history)
+        if count == 0:
+            # Tab opened before the first sample (e.g. the unit is unreachable).
+            return
         if len(self._x_cache) != count:
-            self._x_cache = list(range(count))
+            step = POLL_MS / 1000.0
+            self._x_cache = [-(count - 1 - i) * step for i in range(count)]
         self.downlink_curve.setData(self._x_cache, list(self.downlink_history))
         self.uplink_curve.setData(self._x_cache, list(self.uplink_history))
+        self._apply_ranges(
+            self._next_top(self._down_top, max(self.downlink_history), self.DOWN_FLOOR_KBS),
+            self._next_top(self._up_top, max(self.uplink_history), self.UP_FLOOR_KBS),
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._painted_stats:
+            elide_into(self.stats, self._painted_stats)
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._dirty = True
         self._flush()
         # The linked right-hand ViewBox has no valid geometry until the plot has
         # been laid out at least once.
@@ -1169,6 +1629,10 @@ class MainWindow(QMainWindow):
         self._error_streak = 0
         self.demo_mode = False
         self.demo_source = DemoSource()
+        # Deltas of the unit's since-power-on counters (LDPC, overflow, ...).
+        self.counters = CounterWindow()
+        self._last_poll_t: Optional[float] = None
+        self._poll_dt: Optional[float] = None
         self.help_dialog = None
         self.last_data = None
         self.last_state: Optional[TelemetryState] = None
@@ -1225,9 +1689,9 @@ class MainWindow(QMainWindow):
         quick_layout.setContentsMargins(5, 5, 5, 5)
         quick_layout.setHorizontalSpacing(4)
         quick_layout.setVerticalSpacing(4)
-        self.quick_air_signal = QLabel("A SIG\n--")
+        self.quick_air_signal = QLabel("AIR\n-- / --")
         self.quick_air_quality = QLabel("A Q\n--")
-        self.quick_ground_signal = QLabel("G SIG\n--")
+        self.quick_ground_signal = QLabel("GND\n-- / --")
         self.quick_ground_quality = QLabel("G Q\n--")
         self.quick_fpv = QLabel("FPV")
         self.quick_fpv.setObjectName("quickRcLabel")
@@ -1248,9 +1712,12 @@ class MainWindow(QMainWindow):
         for metric in (self.quick_air_signal, self.quick_air_quality, self.quick_ground_signal, self.quick_ground_quality):
             metric.setObjectName("quickMetric")
             metric.setAlignment(Qt.AlignCenter)
-            metric.setMinimumSize(62, 42)
+            metric.setMinimumSize(52, 42)
             metric.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
             metric.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        # Signal cells carry both antennas and the TX power, so they get the room.
+        for metric in (self.quick_air_signal, self.quick_ground_signal):
+            metric.setMinimumSize(92, 42)
         self.quick_fpv.setMinimumSize(38, 42)
         self.quick_fpv.setStyleSheet("color: #eaf2f8; font-size: 11px; font-weight: 800;")
         self.quick_rc.setMinimumSize(32, 42)
@@ -1291,12 +1758,20 @@ class MainWindow(QMainWindow):
         grid.setVerticalSpacing(10)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
-        self.air_signal_card = MetricCard("AIR SIGNAL")
-        self.ground_signal_card = MetricCard("GROUND SIGNAL")
+        # Row layout (two columns, air left / ground right):
+        #   signal (RF1 + RF2 bars, TX power)  |  signal
+        #   quality (SNR + FEC error rate)     |  quality
+        #   link (MCS, freq, throughput)       |  control (bind, SBUS/PPM, uplink)
+        #   temperature                        |  temperature
+        #   ping latency                       |  ping latency
+        # The old ANTENNA cards are gone: which chain is active is now marked
+        # directly on the antenna bars.
+        self.air_signal_card = SignalCard("AIR SIGNAL")
+        self.ground_signal_card = SignalCard("GROUND SIGNAL")
         self.air_quality_card = MetricCard("AIR QUALITY")
         self.ground_quality_card = MetricCard("GROUND QUALITY")
-        self.air_ant_card = MetricCard("AIR ANTENNA")
-        self.ground_ant_card = MetricCard("GROUND ANTENNA")
+        self.link_card = MetricCard("LINK")
+        self.control_card = MetricCard("CONTROL")
         self.air_temp_card = MetricCard("AIR TEMP")
         self.ground_temp_card = MetricCard("GROUND TEMP")
         self.air_latency_card = MetricCard("AIR LAT")
@@ -1306,8 +1781,8 @@ class MainWindow(QMainWindow):
             self.ground_signal_card,
             self.air_quality_card,
             self.ground_quality_card,
-            self.air_ant_card,
-            self.ground_ant_card,
+            self.link_card,
+            self.control_card,
             self.air_temp_card,
             self.ground_temp_card,
             self.air_latency_card,
@@ -1421,7 +1896,8 @@ class MainWindow(QMainWindow):
         self.worker.error_ready.connect(self.on_error)
         self.api_url_changed.connect(self.worker.set_api_url)
         self.worker.set_api_url(self.api_url())  # safe: thread not started yet
-        self.thread.start()
+        if NETWORK_ENABLED:
+            self.thread.start()
 
         self.net_thread = QThread(self)
         self.net_worker = NetworkWorker()
@@ -1431,7 +1907,8 @@ class MainWindow(QMainWindow):
         self.hosts_changed.connect(self.net_worker.set_hosts)
         self.ping_requested.connect(self.net_worker.poll)
         self.net_worker.set_hosts(self._host_map())  # safe: thread not started yet
-        self.net_thread.start()
+        if NETWORK_ENABLED:
+            self.net_thread.start()
 
         self._size_grip = QSizeGrip(self)
         self._size_grip.setFixedSize(20, 20)
@@ -1534,11 +2011,11 @@ class MainWindow(QMainWindow):
             if root:
                 root.setContentsMargins(0, 0, 0, 0)
                 root.setSpacing(0)
-            self.quick_panel.setFixedSize(430, 58)
+            self.quick_panel.setFixedSize(COMPACT_W, COMPACT_H)
             self.quick_panel.setStyleSheet("background: transparent; border: 0;")
             self.centralWidget().setStyleSheet("background: transparent;")
-            self.centralWidget().setFixedSize(430, 58)
-            self.setFixedSize(430, 58)
+            self.centralWidget().setFixedSize(COMPACT_W, COMPACT_H)
+            self.setFixedSize(COMPACT_W, COMPACT_H)
         else:
             self.quick_panel.setStyleSheet("")
             self.centralWidget().setStyleSheet("")
@@ -1635,9 +2112,6 @@ class MainWindow(QMainWindow):
                 latency_color(ground),
             )
 
-    def _quality_debug_text(self, label: str, snr: Optional[float], ldpc: Optional[float], q: Optional[int]) -> str:
-        return f"{label} SNR={snr if snr is not None else 'N/A'} LDPC={ldpc if ldpc is not None else 'N/A'} Q={q if q is not None else 'N/A'}"
-
     def update_banner(self, text: str, color: str):
         """The banner shows link state only.
 
@@ -1661,54 +2135,87 @@ class MainWindow(QMainWindow):
         # when it is not on screen.
         if not self.compact_mode:
             return
-        key = (s.air_signal_pct, s.air_quality_pct, s.ground_signal_pct, s.ground_quality_pct)
+        key = (s.air_rssi0, s.air_rssi1, s.air_tx_dbm, s.air_signal_pct, s.air_quality_pct,
+               s.ground_rssi0, s.ground_rssi1, s.ground_tx_dbm, s.ground_signal_pct, s.ground_quality_pct)
         if key == self._quick_metric_key:
             return
         self._quick_metric_key = key
-        self.quick_air_signal.setToolTip(f"Air signal: {s.air_signal_pct}% | RSSI: {s.air_best_rssi} dBm")
-        self.quick_air_quality.setToolTip(f"Air quality: {s.air_quality_pct}% | SNR: {s.air_snr} | LDPC: {s.air_ldpc_fail}")
-        self.quick_ground_signal.setToolTip(f"Ground signal: {s.ground_signal_pct}% | RSSI: {s.ground_best_rssi} dBm")
-        self.quick_ground_quality.setToolTip(f"Ground quality: {s.ground_quality_pct}% | SNR: {s.ground_snr} | LDPC: {s.ground_ldpc_fail}")
-        self.quick_air_signal.setText(f"A SIG\n{'--' if s.air_signal_pct is None else str(s.air_signal_pct) + '%'}")
-        self.quick_air_quality.setText(f"A Q\n{'--' if s.air_quality_pct is None else str(s.air_quality_pct) + '%'}")
-        self.quick_ground_signal.setText(f"G SIG\n{'--' if s.ground_signal_pct is None else str(s.ground_signal_pct) + '%'}")
-        self.quick_ground_quality.setText(f"G Q\n{'--' if s.ground_quality_pct is None else str(s.ground_quality_pct) + '%'}")
-        for widget, value in ((self.quick_air_signal, s.air_signal_pct), (self.quick_air_quality, s.air_quality_pct), (self.quick_ground_signal, s.ground_signal_pct), (self.quick_ground_quality, s.ground_quality_pct)):
-            color = metric_color(value)
+
+        def rf(v):
+            return '--' if v is None else f"{v:.0f}"
+
+        def head(side, tx):
+            return side if tx is None else f"{side} · TX {tx:g}"
+
+        def pct(v):
+            return '--' if v is None else f"{v}%"
+
+        cells = (
+            (self.quick_air_signal,
+             head('AIR', s.air_tx_dbm) + "\n" + f"{rf(s.air_rssi0)} / {rf(s.air_rssi1)}",
+             signal_color(s.air_signal_pct),
+             f"AIR  RF1 {rf(s.air_rssi0)} dBm  RF2 {rf(s.air_rssi1)} dBm" + "\n" + format_tx_power(s.air_tx_dbm)),
+            (self.quick_air_quality,
+             "A Q\n" + pct(s.air_quality_pct),
+             metric_color(s.air_quality_pct),
+             f"Air quality {pct(s.air_quality_pct)}  SNR {s.air_snr}  FEC errors {format_error_rate(s.air_ldpc_rate)}"),
+            (self.quick_ground_signal,
+             head('GND', s.ground_tx_dbm) + "\n" + f"{rf(s.ground_rssi0)} / {rf(s.ground_rssi1)}",
+             signal_color(s.ground_signal_pct),
+             f"GROUND  RF1 {rf(s.ground_rssi0)} dBm  RF2 {rf(s.ground_rssi1)} dBm" + "\n" + format_tx_power(s.ground_tx_dbm)),
+            (self.quick_ground_quality,
+             "G Q\n" + pct(s.ground_quality_pct),
+             metric_color(s.ground_quality_pct),
+             f"Ground quality {pct(s.ground_quality_pct)}  SNR {s.ground_snr}  FEC errors {format_error_rate(s.ground_ldpc_rate)}"),
+        )
+        for widget, text, color, tip in cells:
+            widget.setText(text)
+            widget.setToolTip(tip)
             widget.setStyleSheet(f"background: #10161c; border: 1px solid {color}; border-radius: 6px; color: {color}; font-size: 10px; font-weight: 800;")
 
+    def _counter_rate(self, key: str) -> Optional[float]:
+        """Per-second rate of a device counter over the recent window."""
+        moved = self.counters.recent(key)
+        polls = self.counters.span_polls(key)
+        if moved is None or polls == 0:
+            return None
+        return moved / (polls * POLL_MS / 1000.0)
+
     def build_state(self, data: Dict[str, Any]) -> TelemetryState:
-        air_rssi = [to_dbm(data.get('airRSSI0')), to_dbm(data.get('airRSSI1'))]
-        ground_rssi = [to_dbm(data.get('groundRSSI0')), to_dbm(data.get('groundRSSI1'))]
-        air_best = max([v for v in air_rssi if v is not None], default=None)
-        ground_best = max([v for v in ground_rssi if v is not None], default=None)
+        """Turn one raw payload into display values.
+
+        Field names are the ones the ground unit actually sends (verified
+        against a live 55-field capture). Earlier versions also probed a dozen
+        guessed aliases -- airQuality, uplinkLQ, groundLinkQualit, groundLdpc,
+        A-AD9361Temp, ... -- none of which the hardware ever reports.
+        """
+        air_rssi0, air_rssi1 = to_dbm(data.get('airRSSI0')), to_dbm(data.get('airRSSI1'))
+        ground_rssi0, ground_rssi1 = to_dbm(data.get('groundRSSI0')), to_dbm(data.get('groundRSSI1'))
+        air_best = max([v for v in (air_rssi0, air_rssi1) if v is not None], default=None)
+        ground_best = max([v for v in (ground_rssi0, ground_rssi1) if v is not None], default=None)
         air_status = safe_text(data.get('airLinkStatus'))
         ground_status = safe_text(data.get('groundLinkStatus'))
         both_track = air_status.lower() == 'track' and ground_status.lower() == 'track'
+        # The unit estimates distance from the radio link itself, so 0 m with
+        # the aircraft on the bench is a real reading, not a missing GPS fix.
         distance = parse_number(data.get('distance'))
         distance_text = f"{int(round(distance))} m" if both_track and distance is not None else 'N/A'
         air_snr = parse_number(data.get('airSnr'))
         ground_snr = parse_number(data.get('groundSnr'))
-        air_ldpc = parse_number(data.get('airLdpcFail'))
-        ground_ldpc = parse_number(data.get('groundLdpcFail'))
-        ground_alt = parse_number(data.get('groundLdpc')) or parse_number(data.get('groundLdpFail')) or parse_number(data.get('groundFail'))
-        air_pure_quality = read_percent(
-            str(data.get('airLinkQuality')).replace('%', '').strip() if data.get('airLinkQuality') is not None else None,
-            data.get('airQuality'), data.get('uplinkLQ'), data.get('uplinkQuality')
-        )
-        ground_pure_quality = read_percent(
-            str(data.get('groundLinkQuality')).replace('%', '').strip() if data.get('groundLinkQuality') is not None else None,
-            str(data.get('groundLinkQualit')).replace('%', '').strip() if data.get('groundLinkQualit') is not None else None,
-            data.get('groundQuality'), data.get('downlinkLQ'), data.get('downlinkQuality')
-        )
-        air_latency = self.last_air_latency
-        ground_latency = self.last_ground_latency
-        bitrate_text = str(data.get('downlinkDataRate')) if data.get('downlinkDataRate') is not None else 'N/A'
-        uplink_kbs = parse_kbs(data.get('uplinkDataRate'))
-        downlink_kbs = parse_kbs(data.get('downlinkDataRate'))
-        freq_text = f"{data.get('groundCurrentTxFreq')} MHz" if data.get('groundCurrentTxFreq') is not None else 'N/A'
-        air_true_quality = combine_quality(air_snr, air_ldpc)
-        ground_true_quality = snr_to_percent(ground_snr)
+
+        # FEC quality from how the counters moved recently -- symmetric for both
+        # sides now. Ground used to skip LDPC entirely, most likely because the
+        # lifetime-total bug made it read CRIT.
+        air_ldpc_rate = ldpc_error_rate(self.counters.recent('airLdpcFail'), self.counters.recent('airLdpcPass'))
+        ground_ldpc_rate = ldpc_error_rate(self.counters.recent('groundLdpcFail'), self.counters.recent('groundLdpcPass'))
+
+        mcs_mode, mcs_mbps = parse_mcs(data.get('MCS'))
+        air_ant_mode, air_ant_index = active_antenna(data.get('airCurrentAnt'))
+        ground_ant_mode, ground_ant_index = active_antenna(data.get('groundCurrentAnt'))
+        freq = parse_number(data.get('groundCurrentTxFreq'))
+        if freq is None:
+            freq = parse_number(data.get('CurTxFreq'))
+
         return TelemetryState(
             timestamp=datetime.now().isoformat(timespec='milliseconds'),
             air_status=air_status,
@@ -1717,33 +2224,56 @@ class MainWindow(QMainWindow):
             distance_value=distance,
             air_signal_pct=best_rssi_to_percent(air_best),
             ground_signal_pct=best_rssi_to_percent(ground_best),
-            air_quality_pct=air_true_quality,
-            ground_quality_pct=ground_true_quality,
-            air_pure_quality_pct=air_pure_quality,
-            ground_pure_quality_pct=ground_pure_quality,
+            air_quality_pct=combine_quality(air_snr, air_ldpc_rate),
+            ground_quality_pct=combine_quality(ground_snr, ground_ldpc_rate),
+            air_pure_quality_pct=read_percent(str(data.get('airLinkQuality', '')).replace('%', '')),
+            ground_pure_quality_pct=read_percent(str(data.get('groundLinkQuality', '')).replace('%', '')),
             air_best_rssi=air_best,
             ground_best_rssi=ground_best,
             air_snr=air_snr,
             ground_snr=ground_snr,
-            air_ldpc_fail=air_ldpc,
-            ground_ldpc_fail=ground_ldpc if ground_ldpc is not None else ground_alt,
-            air_latency_ms=air_latency,
-            ground_latency_ms=ground_latency,
+            air_ldpc_fail=parse_number(data.get('airLdpcFail')),
+            ground_ldpc_fail=parse_number(data.get('groundLdpcFail')),
+            air_latency_ms=self.last_air_latency,
+            ground_latency_ms=self.last_ground_latency,
             air_ant=safe_text(data.get('airCurrentAnt')),
             ground_ant=safe_text(data.get('groundCurrentAnt')),
             mcs=safe_text(data.get('MCS')),
-            bitrate=bitrate_text,
-            freq=freq_text,
+            bitrate=safe_text(data.get('downlinkDataRate')),
+            freq=f"{freq:g} MHz" if freq is not None else 'N/A',
             air_tx=safe_text(data.get('airTxPower')),
             ground_tx=safe_text(data.get('groundTxPower')),
-            uplink_kbs=uplink_kbs,
-            downlink_kbs=downlink_kbs,
+            uplink_kbs=parse_kbs(data.get('uplinkDataRate')),
+            downlink_kbs=parse_kbs(data.get('downlinkDataRate')),
             link_summary='TRACK' if both_track else f"AIR {air_status} / GND {ground_status}",
+            air_rssi0=air_rssi0,
+            air_rssi1=air_rssi1,
+            ground_rssi0=ground_rssi0,
+            ground_rssi1=ground_rssi1,
+            air_ant_mode=air_ant_mode,
+            ground_ant_mode=ground_ant_mode,
+            air_ant_index=air_ant_index,
+            ground_ant_index=ground_ant_index,
+            air_tx_dbm=parse_number(data.get('airTxPower')),
+            ground_tx_dbm=parse_number(data.get('groundTxPower')),
+            air_ldpc_rate=air_ldpc_rate,
+            ground_ldpc_rate=ground_ldpc_rate,
+            mcs_mode=mcs_mode,
+            mcs_mbps=mcs_mbps,
+            freq_mhz=freq,
+            air_temp_c=parse_number(data.get('airAD9361Temp')),
+            ground_temp_c=parse_number(data.get('groundAD9361Temp')),
+            sbus_per_s=self._counter_rate('sbusRxCnt'),
+            ppm_per_s=self._counter_rate('ppmRxCnt'),
+            bind_status=safe_text(data.get('bindStatus')),
         )
 
     def toggle_demo(self):
         """Feed the UI from DemoSource instead of the radio."""
         self.demo_mode = not self.demo_mode
+        # Counter deltas across two different sources are meaningless (the
+        # simulator's totals start from zero, the unit's are in the millions).
+        self.counters.reset()
         if self.demo_mode:
             self.demo_source.reset()
             self.demo_timer.start()
@@ -1804,8 +2334,8 @@ class MainWindow(QMainWindow):
         self._error_streak = 0
         if hasattr(self, "view_tabs") and self.view_tabs.currentIndex() == 2:
             self.update_raw_data_view(data)
-        air_temp = parse_number(data.get('airAD9361Temp')) or parse_number(data.get('A-AD9361Temp'))
-        ground_temp = parse_number(data.get('groundAD9361Temp')) or parse_number(data.get('G-AD9361Temp'))
+        # Counters first: build_state reads their deltas.
+        self.counters.update(data, COUNTER_KEYS)
         s = self.build_state(data)
         self.last_state = s
         uav = data.get("UAV")
@@ -1816,24 +2346,48 @@ class MainWindow(QMainWindow):
         banner_status = 'track' if s.link_summary == 'TRACK' else 'init' if 'INIT' in s.link_summary.upper() else 'lost'
         self.update_banner(s.link_summary, status_color(banner_status))
         self.distance_card.update_data(s.distance_text, f"AIR: {s.air_status} | GND: {s.ground_status}", '#ecf0f1')
-        self.air_signal_card.update_data('--' if s.air_signal_pct is None else f"{s.air_signal_pct}%", f"Best RSSI: {s.air_best_rssi:.0f} dBm" if s.air_best_rssi is not None else 'Best RSSI: N/A', signal_color(s.air_signal_pct))
-        self.ground_signal_card.update_data('--' if s.ground_signal_pct is None else f"{s.ground_signal_pct}%", f"Best RSSI: {s.ground_best_rssi:.0f} dBm" if s.ground_best_rssi is not None else 'Best RSSI: N/A', signal_color(s.ground_signal_pct))
-        air_quality_text = f"T {('--' if s.air_quality_pct is None else str(s.air_quality_pct) + '%')} | P {('--' if s.air_pure_quality_pct is None else str(s.air_pure_quality_pct) + '%')}"
-        air_quality_detail = f"True: {self._quality_debug_text('AIR', s.air_snr, s.air_ldpc_fail, s.air_quality_pct)} | Pure: {('--' if s.air_pure_quality_pct is None else str(s.air_pure_quality_pct) + '%')}"
-        ground_quality_text = f"T {('--' if s.ground_quality_pct is None else str(s.ground_quality_pct) + '%')} | P {('--' if s.ground_pure_quality_pct is None else str(s.ground_pure_quality_pct) + '%')}"
-        ground_quality_detail = f"True: SNR={s.ground_snr if s.ground_snr is not None else 'N/A'} Q={s.ground_quality_pct if s.ground_quality_pct is not None else 'N/A'} | Pure: {('--' if s.ground_pure_quality_pct is None else str(s.ground_pure_quality_pct) + '%')} | LDPC raw={s.ground_ldpc_fail if s.ground_ldpc_fail is not None else 'N/A'}"
-        self.air_quality_card.update_data(air_quality_text, air_quality_detail, metric_color(s.air_quality_pct), quality_status(s.air_quality_pct), quality_accent(s.air_quality_pct))
-        self.ground_quality_card.update_data(ground_quality_text, ground_quality_detail, metric_color(s.ground_quality_pct), quality_status(s.ground_quality_pct), quality_accent(s.ground_quality_pct))
-        self.air_ant_card.update_data(s.air_ant, 'auto/manual + rf1/rf2', '#8bd3ff')
-        self.ground_ant_card.update_data(s.ground_ant, 'auto/manual + rf1/rf2', '#8bd3ff')
-        self.air_temp_card.update_data('--' if air_temp is None else f'{air_temp:.1f} °C', 'A-AD9361Temp' if air_temp is not None else 'A-AD9361Temp: N/A', temp_color(air_temp))
-        self.ground_temp_card.update_data('--' if ground_temp is None else f'{ground_temp:.1f} °C', 'G-AD9361Temp' if ground_temp is not None else 'G-AD9361Temp: N/A', temp_color(ground_temp))
+        self._render_cards(s)
         # Latency cards are owned by on_net_results; repeating them here was
         # duplicate work on a value that had not changed.
         self.update_warnings(data)
         self.logger.log(s)
         if hasattr(self, "traffic_chart"):
+            self.traffic_chart.set_link(s.mcs_mode, s.mcs_mbps)
             self.traffic_chart.add_sample(s.uplink_kbs, s.downlink_kbs)
+
+    def _render_cards(self, s: TelemetryState):
+        self.air_signal_card.update_data(
+            s.air_signal_pct, s.air_rssi0, s.air_rssi1, s.air_ant_index, s.air_ant_mode, s.air_tx_dbm)
+        self.ground_signal_card.update_data(
+            s.ground_signal_pct, s.ground_rssi0, s.ground_rssi1, s.ground_ant_index, s.ground_ant_mode, s.ground_tx_dbm)
+
+        for card, q, pure, snr, rate in (
+            (self.air_quality_card, s.air_quality_pct, s.air_pure_quality_pct, s.air_snr, s.air_ldpc_rate),
+            (self.ground_quality_card, s.ground_quality_pct, s.ground_pure_quality_pct, s.ground_snr, s.ground_ldpc_rate),
+        ):
+            value = f"T {'--' if q is None else f'{q}%'} | P {'--' if pure is None else f'{pure}%'}"
+            snr_text = '--' if snr is None else f"{snr:g} dB"
+            detail = f"SNR {snr_text} · FEC errors {format_error_rate(rate)}"
+            card.update_data(value, detail, metric_color(q), quality_status(q), quality_accent(q))
+
+        capacity = f"{s.mcs_mbps:g} Mb/s" if s.mcs_mbps else "capacity N/A"
+        freq = f"{s.freq_mhz:g} MHz" if s.freq_mhz is not None else "freq N/A"
+        down = '--' if s.downlink_kbs is None else f"{s.downlink_kbs:.0f}"
+        up = '--' if s.uplink_kbs is None else f"{s.uplink_kbs:.0f}"
+        self.link_card.update_data(
+            s.mcs_mode, f"{capacity} · {freq} · DL {down} / UL {up} kb/s", '#8bd3ff')
+
+        bound = s.bind_status.lower() in ("bind", "bound", "ok")
+        rc = ("RC ip not set" if not self.rc_host
+              else "RC ping ok" if self.rc_online
+              else "RC no ping" if self.rc_online is False else "RC ...")
+        self.control_card.update_data(
+            s.bind_status.upper(),
+            f"SBUS {format_rate(s.sbus_per_s)} · PPM {format_rate(s.ppm_per_s)} · {rc}",
+            '#2ecc71' if bound else '#ff5c5c')
+
+        for card, temp in ((self.air_temp_card, s.air_temp_c), (self.ground_temp_card, s.ground_temp_c)):
+            card.update_data('--' if temp is None else f'{temp:.0f} °C', 'AD9361 RF transceiver', temp_color(temp))
 
     def _on_view_tab_changed(self, index: int):
         if index == 2:
@@ -1867,7 +2421,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "warn_bar") or not hasattr(self, "warn_label"):
             return
         data = data if data is not None else (self.last_data or {})
-        msgs = warning_messages(data, self.last_air_latency, self.last_ground_latency, self.fpv_online, self.rc_online)
+        msgs = warning_messages(data, self.last_air_latency, self.last_ground_latency, self.fpv_online, self.rc_online, self.counters)
         text = " | ".join(msgs) if msgs else ""
         if text == self._painted_warn:
             return
@@ -1892,12 +2446,14 @@ class MainWindow(QMainWindow):
             return
         self.update_banner('NO API', '#ff7b7b')
         self.distance_card.update_data('N/A', message[:80], '#bdc3c7')
-        self.air_signal_card.update_data('--', 'waiting for data', '#7a7f87')
-        self.ground_signal_card.update_data('--', 'waiting for data', '#7a7f87')
+        for card in (self.air_signal_card, self.ground_signal_card):
+            card.update_data(None, None, None, None, '', None, note='waiting for data')
         self.air_quality_card.update_data('--', 'waiting for data', '#7a7f87', 'N/A', '#182129')
         self.ground_quality_card.update_data('--', 'waiting for data', '#7a7f87', 'N/A', '#182129')
-        self.air_ant_card.update_data('--', 'waiting for data', '#7a7f87')
-        self.ground_ant_card.update_data('--', 'waiting for data', '#7a7f87')
+        self.link_card.update_data('--', 'waiting for data', '#7a7f87')
+        self.control_card.update_data('--', 'waiting for data', '#7a7f87')
+        # The unit may have rebooted while unreachable; start the deltas over.
+        self.counters.reset()
         self._update_quick_host_indicators()
 
     def show_help(self):
@@ -1931,11 +2487,31 @@ class MainWindow(QMainWindow):
             row = QLabel(f"{k} — {v}")
             row.setStyleSheet("font-size: 14px; color: #d6eaf8;")
             lay.addWidget(row)
+
+        legend_title = QLabel("Як читати картки")
+        legend_title.setStyleSheet("font-size: 16px; font-weight: 800; color: #eaf2f8; padding-top: 8px;")
+        lay.addWidget(legend_title)
+        legend = [
+            "SIGNAL — RF1 / RF2: рівень кожної антени в dBm; крапка = активна антена. "
+            f"Шкала смуги {RSSI_MIN_DBM:g}…{RSSI_MAX_DBM:g} dBm. TX — вихідна потужність модуля.",
+            "QUALITY — T: розрахунок програми (гірше з SNR і частки помилок FEC за останні ~6 с). "
+            "P: якість лінку, яку повідомляє сам модуль.",
+            "LINK — модуляція (MCS), пропускна здатність, частота, поточний трафік.",
+            "CONTROL — статус bind, кадри SBUS/PPM за секунду, пінг пульта.",
+            "Попередження по лічильниках (overflow, discard, FEC) з'являються лише коли "
+            "лічильник росте, і гаснуть самі.",
+        ]
+        for text in legend:
+            row = QLabel(text)
+            row.setWordWrap(True)
+            row.setStyleSheet("font-size: 13px; color: #b9c7d3;")
+            lay.addWidget(row)
+
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(dlg.close)
         lay.addWidget(close_btn)
         dlg.setStyleSheet("background: #101418; color: #eaf2f8;")
-        dlg.resize(360, 300)
+        dlg.resize(480, 520)
         dlg.show()
         self.help_dialog = dlg
 
@@ -2225,6 +2801,9 @@ QLabel {{ background: transparent; }}
 #cardValue {{ font-size:{medium}px; font-weight:800; }}
 #cardValueBig {{ font-size:{big}px; font-weight:900; }}
 #cardDetail {{ font-size:{max(8, base-1)}px; color:#b9c7d3; }}
+#antBar {{ background: transparent; font-size:{base + 1}px; font-weight:700; min-height:{max(18, int(base * 1.9))}px; }}
+#txPill {{ background:#10161c; border:1px solid #32414d; border-radius:6px; padding:1px 7px; color:#8bd3ff; font-size:{base}px; font-weight:800; }}
+#chartStats {{ color:#b9c7d3; font-size:{base}px; font-weight:600; padding: 0 4px; }}
 #footer {{ font-size:{base}px; color:#6f8598; padding: 2px; }}
 #warnBar {{ background:#2a2113; border:1px solid #5c4a1d; border-radius:8px; }}
 #warnLabel {{ color:#ffd24d; font-size:{base}px; font-weight:700; }}
@@ -2283,6 +2862,19 @@ def run_selftest(app: QApplication) -> int:
     check("demo data feeds UI", lambda: (win.toggle_demo(), app.processEvents(),
                                          (_ for _ in ()).throw(RuntimeError("no state"))
                                          if win.last_state is None else None))
+
+    def antennas_and_power():
+        for _ in range(3):
+            win._demo_tick()
+            app.processEvents()
+        for card in (win.air_signal_card, win.ground_signal_card):
+            if any(bar.dbm is None for bar in card.bars):
+                raise RuntimeError(f"{card._base_title}: antenna level missing")
+            if not card.tx.text().startswith("TX ") or card.tx.text() == "TX --":
+                raise RuntimeError(f"{card._base_title}: TX power missing")
+        if win.last_state.air_ldpc_rate is None:
+            raise RuntimeError("FEC error rate not computed from counter deltas")
+    check("both antennas + TX power shown", antennas_and_power)
 
     def tabs():
         for i in range(win.view_tabs.count()):
