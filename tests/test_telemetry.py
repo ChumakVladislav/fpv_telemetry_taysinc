@@ -12,20 +12,29 @@ with the hardware's cumulative counters, so the tests use its actual data.
 """
 
 import copy
+import csv
 import importlib.util
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ["TAISYNC_OFFLINE"] = "1"
+# Settings, window position and flight logs go to a throwaway directory, never
+# to the real %APPDATA%\TaisyncTelemetry.
+_DATA_TMP = tempfile.TemporaryDirectory(prefix="taisync_test_")
+os.environ["TAISYNC_DATA_DIR"] = _DATA_TMP.name
 
 ROOT = Path(__file__).resolve().parent.parent
+APP_FILE = ROOT / "fpv_telemetry_v1_40.py"
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "live_samples.json"
 
-_spec = importlib.util.spec_from_file_location("telemetry_app", ROOT / "fpv_telemetry_v1_39.py")
+_spec = importlib.util.spec_from_file_location("telemetry_app", APP_FILE)
 app_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(app_mod)
 
@@ -247,9 +256,37 @@ def test_both_antennas_and_tx_power_visible():
         assert gnd.tx.text() == "TX 27 dBm · 501 mW"
         assert win.link_card._value_text == "16QAM 1/2"
         assert "7.86 Mb/s" in win.link_card._detail_text and "1410 MHz" in win.link_card._detail_text
-        assert win.control_card._value_text == "BIND"
     finally:
         close_window(win)
+
+
+def test_no_control_card_rc_latency_instead():
+    """SBUS/PPM is irrelevant (RC goes over UART as CRSF) and BIND duplicated
+    TRACK, so the CONTROL card is gone; its slot shows RC ping."""
+    win = make_window()
+    try:
+        assert not hasattr(win, "control_card")
+        assert win.rc_host == app_mod.DEFAULT_RC_HOST == "192.168.199.23"
+        win.on_net_results({"hosts": win._host_map(), "latency": {"air": 5, "ground": 3, "rc": 7}})
+        win.on_data(LIVE[-1])
+        drain()
+        assert win.rc_latency_card._value_text == "7 ms"
+        assert "192.168.199.23" in win.rc_latency_card._detail_text
+        texts = " ".join(c._base_title + str(getattr(c, "_detail_text", "")) for c in win._cards)
+        assert "SBUS" not in texts and "PPM" not in texts and "BIND" not in texts
+        assert "sbusRxCnt" not in app_mod.COUNTER_KEYS
+    finally:
+        close_window(win)
+
+
+def test_settings_dialog_prefills_rc_ip():
+    dlg = app_mod.SettingsDialog("", "", "")
+    values = dlg.values()
+    assert values["rc_host"] == "192.168.199.23"
+    assert values["ground_host"] == app_mod.DEFAULT_GROUND_HOST
+    dlg.rc_edit.setText("10.0.0.5")
+    dlg.reset_defaults()
+    assert dlg.values()["rc_host"] == "192.168.199.23"
 
 
 def test_compact_overlay_shows_both_antennas():
@@ -309,7 +346,7 @@ def test_traffic_tab_before_any_data():
 def test_inline_titles_track_live_values():
     win = make_window()
     try:
-        win.resize(700, 700)
+        win.resize(450, 700)  # narrow: single column, values inline
         drain(100)
         win._apply_responsive_layout()
         drain()
@@ -385,6 +422,360 @@ def test_poll_cost_and_no_restyle():
         assert per_poll_ms < 15, f"{per_poll_ms:.1f} ms per poll"
     finally:
         close_window(win)
+
+
+# --------------------------------------------- v1.40: layout breakpoints
+
+def _layout_at(win, w, h):
+    win.resize(w, h)
+    drain(30)
+    win._apply_responsive_layout()
+    drain()
+    return win._single_column, win._inline_cards, win._status_stacked
+
+
+def test_layout_breakpoints():
+    """compact overlay / medium (one column) / large (two columns).
+
+    v1.39 needed 860 px of panel *and* 760 px of height for two columns, so a
+    wide-but-short window was stuck in one long column.
+    """
+    win = make_window()
+    try:
+        single, inline, stacked = _layout_at(win, 420, 900)
+        assert single and inline and stacked, "narrow window: one column, values inline"
+        single, inline, _ = _layout_at(win, 680, 720)
+        assert not single, "680 px wide is enough for two columns"
+        assert not inline, "two columns at 720 px high still fit full cards"
+        single, _, stacked = _layout_at(win, 1280, 700)
+        assert not single and not stacked, "wide but short: two columns, not one tall one"
+        single, inline, _ = _layout_at(win, 420, 1100)
+        assert single and not inline, "tall narrow window has room for full cards"
+        # Hysteresis: just under the breakpoint going back keeps two columns...
+        _layout_at(win, 900, 800)
+        threshold_w = app_mod.TWO_COLUMN_MIN_W + 16  # panel width + window margins
+        single, _, _ = _layout_at(win, threshold_w + 5, 800)
+        assert not single
+        # ...and well under it switches.
+        single, _, _ = _layout_at(win, threshold_w - 30, 800)
+        assert single
+    finally:
+        close_window(win)
+
+
+def test_expand_returns_to_previous_size():
+    win = make_window()
+    try:
+        win.resize(1000, 800)
+        drain(30)
+        win.toggle_compact_view()
+        drain()
+        assert (win.width(), win.height()) == (app_mod.COMPACT_W, app_mod.COMPACT_H)
+        win.toggle_compact_view()
+        drain(30)
+        assert (win.width(), win.height()) == (1000, 800), (win.width(), win.height())
+    finally:
+        close_window(win)
+
+
+# --------------------------------------------- v1.40: multi-monitor
+
+def test_drag_to_second_monitor():
+    """The window used to stop dead at the edge of the monitor it started on."""
+    with tempfile.TemporaryDirectory() as tmp:
+        screens = {"screens": [
+            {"name": "A", "x": 0, "y": 0, "width": 1920, "height": 1080},
+            {"name": "B", "x": 1920, "y": 0, "width": 1920, "height": 1080},
+        ]}
+        Path(tmp, "screens.json").write_text(json.dumps(screens), encoding="utf-8")
+        env = dict(os.environ)
+        env.pop("QT_QPA_PLATFORM", None)
+        out = subprocess.run(
+            [sys.executable, str(Path(__file__).parent / "multimonitor_probe.py"), str(APP_FILE)],
+            cwd=tmp, env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert out.returncode == 0, out.stderr[-2000:]
+        result = json.loads(out.stdout.strip().splitlines()[-1])
+    assert len(result["screens"]) == 2, result
+    assert result["after_drag"][0] >= 1920, f"window did not cross to monitor 2: {result}"
+    assert result["after_drag"][0] + 800 <= 3840, f"window must stay inside monitor 2: {result}"
+    assert result["after_snap"][0] > 1920 + 1000, f"snap must use monitor 2: {result}"
+    assert result["compact_after_drag"][0] >= 1920, f"compact overlay did not cross: {result}"
+
+
+def test_window_position_restored_only_if_on_screen():
+    settings = app_mod.SETTINGS_PATH
+    try:
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({
+            "ground_host": "192.168.199.16", "air_host": "192.168.199.18", "rc_host": "",
+            "window": {"x": 40, "y": 30, "w": 900, "h": 760, "compact": False, "topmost": True},
+        }), encoding="utf-8")
+        win = app_mod.MainWindow()
+        try:
+            assert (win.x(), win.y(), win.width(), win.height()) == (40, 30, 900, 760)
+            assert win.rc_host == "192.168.199.23", "pre-1.40 empty RC IP must fall back to the default"
+        finally:
+            close_window(win)
+        # A monitor that is gone: must not strand the window off-screen.
+        settings.write_text(json.dumps({"window": {"x": 9000, "y": 9000, "w": 900, "h": 760}}), encoding="utf-8")
+        win = app_mod.MainWindow()
+        try:
+            screen = app_mod.QGuiApplication.primaryScreen().availableGeometry()
+            assert screen.contains(win.frameGeometry().topLeft()), (win.x(), win.y())
+        finally:
+            close_window(win)
+    finally:
+        settings.unlink(missing_ok=True)
+
+
+# --------------------------------------------- v1.40: flight log
+
+def _write_log(path, rows):
+    with open(path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def test_recording_writes_clean_csv():
+    win = make_window()
+    try:
+        win.set_recording(False)
+        win.set_recording(True)
+        assert "REC" in win.title_bar.rec_btn.text() and win.title_bar.rec_btn.isVisibleTo(win)
+        assert win.logger.path is None, "file is created lazily on the first row"
+        for sample in LIVE:
+            win.on_data(sample)
+            drain()
+        path = win.logger.path
+        assert path is not None and path.exists()
+        win.set_recording(False)
+        data = app_mod.load_log(path)
+        assert data.columns == app_mod.LOG_FIELDS
+        assert len(data.rows) == len(LIVE)
+        last = data.rows[-1]
+        s = LIVE[-1]
+        assert last["air_rssi0_dbm"] == str(s["airRSSI0"])
+        assert last["link"] == "TRACK" and last["source"] == "live"
+        assert data.series("air_snr_db")[-1] == float(s["airSnr"])
+        assert "sbus" not in ",".join(data.columns).lower()
+    finally:
+        close_window(win)
+
+
+def test_demo_is_logged_to_separate_file():
+    win = make_window()
+    try:
+        win.set_recording(True)
+        win.toggle_demo()
+        for _ in range(3):
+            win._demo_tick()
+            drain()
+        demo_path = win.logger.path
+        assert demo_path is not None and "demo" in demo_path.name
+        win.toggle_demo()
+        assert win.logger.path is None or "demo" not in win.logger.path.name
+        win.set_recording(False)
+    finally:
+        close_window(win)
+
+
+def test_linear_fit():
+    a, b, r, n = app_mod.linear_fit([0, 1, 2, 3, None], [20, 18, 16, 14, 99])
+    assert abs(a - 20) < 1e-9 and abs(b + 2) < 1e-9 and abs(r + 1) < 1e-9 and n == 4
+    assert app_mod.linear_fit([1, 1, 1], [1, 2, 3]) is None
+    assert app_mod.linear_fit([1, 2], [1, 2]) is None
+
+
+def test_log_analysis_finds_events_and_snr_trend():
+    rows = []
+    t0 = datetime(2026, 10, 14, 12, 0, 0)
+    for i in range(60):
+        dist = i * 50.0
+        link = "TRACK" if not (30 <= i < 35) else "AIR init / GND init"
+        warn = "AIR latency 150 ms" if 10 <= i < 14 else ""
+        sec = i * 1.2 + (20 if i >= 50 else 0)  # 20 s gap before row 50
+        rows.append({
+            "timestamp": (t0 + timedelta(seconds=sec)).isoformat(timespec="milliseconds"),
+            "link": link,
+            "distance_m": f"{dist:.0f}",
+            "air_snr_db": f"{25 - dist / 200:.1f}",
+            "ground_snr_db": f"{28 - dist / 250:.1f}",
+            "air_quality_pct": "100" if dist < 2000 else "40",
+            "air_ant": "auto-rf1",
+            "warnings": warn,
+        })
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "flight.csv"
+        _write_log(path, rows)
+        data = app_mod.load_log(path)
+    assert "air_ant" not in data.numeric and "distance_m" in data.numeric
+    events = app_mod.detect_events(data)
+    kinds = [e.kind for e in events]
+    assert kinds[0] == "start" and kinds[-1] == "end"
+    assert kinds.count("loss") == 1 and kinds.count("restore") == 1
+    assert kinds.count("gap") == 1
+    assert sum(1 for e in events if "latency" in e.text) == 1, "a warning is reported once when it appears"
+    summary = "\n".join(app_mod.summarize_log(data))
+    assert "втрат лінку: 1" in summary
+    assert "Макс. відстань 2950 м" in summary
+    assert "AIR SNR ≈ 25.0 -5.0 dB/км" in summary, summary
+    assert "AIR якість < 45% вперше на 2000 м" in summary, summary
+
+
+def test_logs_tab_opens_old_v139_format():
+    """Logs from v1.39 (asdict(TelemetryState) columns) still open."""
+    row = {
+        "timestamp": "2026-09-13T14:38:10.000", "air_status": "track", "ground_status": "track",
+        "distance_text": "120 m", "distance_value": "120.0", "air_snr": "21", "ground_snr": "25",
+        "link_summary": "TRACK", "air_best_rssi": "-40",
+    }
+    rows = [dict(row), dict(row, timestamp="2026-09-13T14:38:11.200", distance_value="180.0", air_snr="19"),
+            dict(row, timestamp="2026-09-13T14:38:12.400", distance_value="240.0", air_snr="17", link_summary="AIR init / GND init")]
+    win = make_window()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "old.csv"
+            _write_log(path, rows)
+            win.view_tabs.setCurrentWidget(win.logs_tab)
+            drain(30)
+            win.logs_tab.load_path(path)
+            drain()
+            tab = win.logs_tab
+            assert tab.data.col("link") == "link_summary"
+            assert tab.data.track == [True, True, False]
+            assert tab.x_combo.currentData() == "distance_value"
+            assert tab.y_combo.currentData() == "air_snr"
+            assert tab.event_list.count() >= 3
+            tab.mode_combo.setCurrentIndex(tab.MODE_TIME)
+            drain()
+            tab.event_list.setCurrentRow(1)
+            drain()
+            win.view_tabs.setCurrentIndex(0)
+    finally:
+        close_window(win)
+
+
+# --------------------------------------------- v1.40: thresholds, sound, cleanup
+
+def test_thresholds_drive_colours_and_warnings():
+    try:
+        assert app_mod.temp_color(55) == "#f1c40f"
+        assert app_mod.quality_status(70) == "MID"
+        app_mod.set_thresholds({"temp_warn": 60, "temp_crit": 70, "quality_good": 65, "junk": 1})
+        assert app_mod.temp_color(55) == "#2ecc71"
+        assert app_mod.quality_status(70) == "GOOD"
+        assert "junk" not in app_mod.THRESHOLDS
+        assert app_mod.warning_messages({"airAD9361Temp": 65}, None, None, None, None) == ["AIR temp warm 65C"]
+        # Swapped pair is put back in order rather than breaking the colours.
+        app_mod.set_thresholds({"latency_warn": 300, "latency_crit": 100})
+        assert app_mod.THRESHOLDS["latency_warn"] == 100 and app_mod.THRESHOLDS["latency_crit"] == 300
+        app_mod.set_thresholds({"rssi_min_dbm": -80, "rssi_max_dbm": -60})
+        assert app_mod.best_rssi_to_percent(-70) == 50
+    finally:
+        app_mod.set_thresholds(None)
+    assert app_mod.THRESHOLDS == app_mod.DEFAULT_THRESHOLDS
+
+
+def test_settings_dialog_tabs_roundtrip():
+    dlg = app_mod.SettingsDialog("1.1.1.1", "2.2.2.2", "3.3.3.3", True,
+                                 thresholds={"temp_warn": 55}, alarm={"quality_below": 0},
+                                 log_retention_days=0)
+    v = dlg.values()
+    assert v["thresholds"]["temp_warn"] == 55 and v["thresholds"]["latency_crit"] == 250
+    assert v["alarm"]["quality_below"] == 0 and v["alarm"]["link_loss"] is True
+    assert v["log_retention_days"] == 0, "cleanup must be off by default"
+    assert not dlg.retention_days.isEnabled()
+    dlg.retention_check.setChecked(True)
+    dlg.retention_days.setValue(14)
+    dlg.threshold_spins["temp_warn"].setValue(40)
+    dlg.reset_thresholds()
+    v = dlg.values()
+    assert v["log_retention_days"] == 14 and v["thresholds"]["temp_warn"] == 50
+
+
+def test_alarm_monitor_logic():
+    cfg = dict(app_mod.DEFAULT_ALARM, repeat_s=10, quality_below=30)
+    m = app_mod.AlarmMonitor()
+    assert m.evaluate(0, False, (), cfg) == [], "no alarm before the first TRACK"
+    assert m.evaluate(1, None, (), cfg) == []
+    assert m.evaluate(2, True, (90, 90), cfg) == []
+    assert m.evaluate(3, False, (), cfg) == ["alarm"], "TRACK lost"
+    assert m.evaluate(5, False, (), cfg) == [], "not every poll"
+    assert m.evaluate(13.5, False, (), cfg) == ["alarm"], "repeats after repeat_s"
+    assert m.evaluate(14, True, (90, 90), cfg) == ["restore"]
+    assert m.evaluate(15, True, (20, 90), cfg) == ["warn"], "quality below threshold"
+    assert m.evaluate(16, True, (20, 90), cfg) == []
+    assert m.evaluate(17, True, (60, 90), cfg) == []
+    assert m.evaluate(18, False, (), dict(cfg, enabled=False)) == [], "master switch"
+    once = app_mod.AlarmMonitor()
+    c1 = dict(cfg, repeat_s=0)
+    once.evaluate(0, True, (), c1)
+    assert once.evaluate(1, False, (), c1) == ["alarm"]
+    assert once.evaluate(100, False, (), c1) == [], "repeat 0 = once"
+
+
+def test_window_sounds_on_link_loss_and_mute():
+    win = make_window()
+    try:
+        win.alarm_cfg = dict(app_mod.DEFAULT_ALARM)
+        win.sound.played.clear()
+        good = copy.deepcopy(LIVE[-1])
+        win.on_data(good)
+        lost = dict(good, airLinkStatus="init", groundLinkStatus="init")
+        win.on_data(lost)
+        assert win.sound.played == ["alarm"]
+        win.on_data(good)
+        assert win.sound.played[-1] == "restore"
+        win.toggle_mute()
+        assert "[MUTE]" in win.title_bar.title.text()
+        n = len(win.sound.played)
+        win.on_data(lost)
+        assert len(win.sound.played) == n, "muted"
+        win.toggle_mute()
+        # Ground unit unreachable counts as link loss (after the grace polls).
+        win.on_data(good)
+        n = len(win.sound.played)
+        for _ in range(app_mod.ERROR_GRACE_POLLS):
+            win.on_error("timeout")
+        assert win.sound.played[n:] == ["alarm"]
+    finally:
+        close_window(win)
+
+
+def test_sound_files_are_valid_wav():
+    import io
+    import wave
+    for name, segments in app_mod.SOUNDS.items():
+        with wave.open(io.BytesIO(app_mod._tone_wav(segments))) as w:
+            assert w.getnframes() > 1000, name
+
+
+def test_log_cleanup_off_by_default_and_spares_current_file():
+    logs = app_mod.LOGS_DIR
+    logs.mkdir(parents=True, exist_ok=True)
+    old = logs / "telemetry_20200101_000000.csv"
+    current = logs / "telemetry_20200101_000001.csv"
+    other = logs / "notes.csv"
+    for p in (old, current, other):
+        p.write_text("x", encoding="utf-8")
+        os.utime(p, (time.time() - 90 * 86400,) * 2)
+    try:
+        assert app_mod.cleanup_old_logs(0) == []
+        assert old.exists()
+        win = make_window()
+        try:
+            assert win.log_retention_days == 0
+            assert old.exists(), "default settings must not delete anything"
+        finally:
+            close_window(win)
+        removed = app_mod.cleanup_old_logs(30, keep=current)
+        assert removed == [old]
+        assert current.exists() and other.exists()
+    finally:
+        for p in (old, current, other):
+            p.unlink(missing_ok=True)
 
 
 def _run_all():

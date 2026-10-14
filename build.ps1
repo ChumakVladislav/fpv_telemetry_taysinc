@@ -17,7 +17,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
-$Version = "1.39"
+$Version = "1.40"
 
 function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 
@@ -99,7 +99,7 @@ if ($Installer) {
         Write-Host "    winget install JRSoftware.InnoSetup" -ForegroundColor Yellow
         throw "ISCC.exe not available"
     }
-    Invoke-Native { & $iscc "installer.iss" }
+    Invoke-Native { & $iscc "/DAppVersion=$Version" "installer.iss" }
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
     $setup = "dist_installer\TaisyncTelemetry-Setup-$Version.exe"
     $setupMb = [math]::Round((Get-Item $setup).Length / 1MB, 1)

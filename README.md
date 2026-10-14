@@ -4,7 +4,7 @@ Telemetry for Taysinc — a always-on-top desktop overlay showing the state of a
 Taisync FPV link: signal, link quality, antennas, temperatures, ping latency,
 distance, and uplink/downlink traffic.
 
-Current version: **`fpv_telemetry_v1_39.py`** (earlier versions are kept for
+Current version: **`fpv_telemetry_v1_40.py`** (earlier versions are kept for
 reference).
 
 ## Running it
@@ -16,7 +16,7 @@ below) and double-click `TaisyncTelemetry.exe`.
 
 ```bash
 pip install -r requirements.txt
-python fpv_telemetry_v1_39.py
+python fpv_telemetry_v1_40.py
 ```
 
 ## Test data (no hardware)
@@ -38,8 +38,23 @@ telemetry is ignored until you turn it back off.
 | **AIR / GROUND SIGNAL** | RSSI of **both** antennas (RF1, RF2) as bars with dBm; the dot marks the active antenna. The pill shows the module's configured **TX power** (dBm and mW). The % in the title is the stronger antenna on a −95…−45 dBm scale. |
 | **AIR / GROUND QUALITY** | **T** — computed here: the worse of SNR and the FEC (LDPC) error rate over the last ~6 s. **P** — the link quality the unit reports itself. |
 | **LINK** | Modulation (MCS), channel capacity, frequency, current downlink / uplink. |
-| **CONTROL** | Bind status, SBUS / PPM frames per second, RC ping. |
+| **RC LAT** | Ping to the RC (пульт), default `192.168.199.23`. |
 | **TEMP**, **LAT** | AD9361 transceiver temperature; ping latency to each unit. |
+
+There is no bind / SBUS card: TRACK in the banner already means bound, and RC
+control goes over UART as CRSF, so SBUS/PPM frame rates mean nothing here.
+
+### Window sizes
+
+| Window width | Layout |
+|---|---|
+| **COMPACT** | 500×58 overlay: both antennas + TX power per side, quality, FPV/RC dots |
+| < ~640 px | one column, values folded into the card titles (full cards once the window is ≥ 1000 px tall); title bar buttons become one-glyph icons |
+| ≥ ~640 px | two columns, air left / ground right, at any height |
+
+The window remembers its position, size, compact mode and TOP state, and moves
+freely between monitors. If the monitor it was on is gone, it snaps to the
+right edge of the main one.
 
 The compact overlay (**COMPACT**) keeps both antennas and the TX power of
 each side on screen: `AIR · TX 1` over `-29 / -20`.
@@ -54,8 +69,51 @@ script, if it needs tuning for a different link.
 
 ## Settings
 
-**SET** in the title bar configures the Ground / Air / RC IPs. The API URL is
-derived as `http://<ground_ip>/v2/baseband.json`.
+**SET** in the title bar configures the Ground / Air / RC IPs (defaults
+`192.168.199.16` / `.18` / `.23`, **Стандартні IP** restores them; an empty
+field means the default) and whether a flight log is recorded automatically at
+start-up. The API URL is derived as `http://<ground_ip>/v2/baseband.json`.
+
+## Sound alarms
+
+- **Link loss** — TRACK lost, or the ground unit stopped answering. Armed only
+  after the first TRACK, so starting the app before the drone is on is quiet.
+- **Low quality** — air or ground quality T below a threshold (30 % by default).
+- Repeats every 10 s while the condition lasts; a short rising tone when TRACK
+  comes back.
+
+`M` mutes for the session (title shows `[MUTE]`). Everything is set in
+**SET → Звук**, including a **Перевірити звук** button.
+
+## Thresholds
+
+**SET → Пороги** sets the green / yellow / red limits for signal %, quality %
+(GOOD/MID/CRIT), temperature and ping — the same numbers drive the warnings —
+and the dBm range of the signal scale. **Стандартні пороги** restores them.
+
+## Flight log and the Logs tab
+
+With auto-logging on (the default) or after pressing **REC** / `R`, every poll
+is written to `%APPDATA%\TaisyncTelemetry\logs\telemetry_<date>_<time>.csv`:
+link state, distance, RSSI per antenna, SNR, quality, FEC error rate, MCS,
+traffic, temperatures, pings and the active warnings. Outages of the ground
+unit are logged as `NO API` rows. The file is created with the first data, so
+running with no radio in range leaves nothing behind. Test-mode data goes to
+separate `telemetry_demo_*.csv` files.
+
+Old logs can be deleted automatically after N days (**SET → Логи**). This is
+**off by default**; the file being recorded is never deleted.
+
+The **Logs** tab opens any log (including v1.39 ones):
+
+- **summary** — duration, % of time in TRACK, link losses, max distance, the
+  worst SNR / RSSI / ping and when they happened, and the SNR-vs-distance trend
+  (`AIR SNR ≈ 26.8 −6.3 dB/км … → SNR 6 dB прогноз на ~3.3 км`);
+- **X ↔ Y** — any column against any other, e.g. distance vs SNR, with a trend
+  line; points where the link was not TRACK are red;
+- **За часом** — one metric over the flight, link-loss stretches shaded red;
+- **events** — link lost / restored, gaps in data, each new warning. Clicking an
+  event marks it on the chart.
 
 Settings and CSV logs are stored per user in:
 
@@ -75,8 +133,9 @@ precedence, so existing source checkouts keep their configuration.
 |---|---|
 | `T` | Always on top on/off |
 | `L` | Lock / unlock dragging |
-| `R` | CSV logging on/off |
+| `R` | Flight log (CSV) on/off — same as **REC** |
 | `D` | Test data on/off |
+| `M` | Mute / unmute sound alarms |
 | `Ctrl` `+` / `-` | Zoom in / out |
 | `Ctrl` `0` | Reset zoom |
 
@@ -96,8 +155,12 @@ Output:
 | Path | What it is |
 |---|---|
 | `dist\TaisyncTelemetry\TaisyncTelemetry.exe` | the application (~136 MB folder) |
-| `dist_zip\TaisyncTelemetry-1.39-portable.zip` | unzip and run, no install (~54 MB) |
-| `dist_installer\TaisyncTelemetry-Setup-1.39.exe` | installer (~39 MB) |
+| `dist_zip\TaisyncTelemetry-1.40-portable.zip` | unzip and run, no install (~54 MB) |
+| `dist_installer\TaisyncTelemetry-Setup-1.40.exe` | installer (~39 MB) |
+
+To release a new version, change `$Version` in `build.ps1`, `APP_VERSION` in
+the script and the numbers in `version_info.txt`. Never change the `AppId` in
+`installer.iss` — that is what makes a new version replace the old one.
 
 If `ISCC.exe` is not in one of the usual locations, point `build.ps1` at it with
 the `ISCC` environment variable.
@@ -136,10 +199,14 @@ and refuses to package a build that fails.
 
 Use either artifact:
 
-- **Installer** — defaults to a per-user install, so it needs no administrator
-  rights on the target machine. Adds a Start Menu entry and an uninstaller;
-  a desktop shortcut is optional. Uninstalling leaves `%APPDATA%\TaisyncTelemetry`
-  in place so a reinstall keeps the configured IPs.
+- **Installer** — per-user install, no administrator rights needed. Each new
+  version installs over the previous one: one "Taisync Telemetry" entry in
+  *Apps & features*, same folder, the running app is asked to close first.
+  Copies left by older builds under other names ("FPV Telemetry" 1.38,
+  "TaisyncTelemetry" 1.37a) are found and, after a confirmation, uninstalled —
+  Windows asks for administrator rights for those that were installed for all
+  users. Their saved IPs are carried over. Uninstalling leaves
+  `%APPDATA%\TaisyncTelemetry` in place so a reinstall keeps settings and logs.
 - **Portable zip** — unpack anywhere and run `TaisyncTelemetry.exe`. Nothing is
   written outside `%APPDATA%\TaisyncTelemetry`.
 
