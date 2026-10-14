@@ -2,8 +2,8 @@
 # Windows version resource embedded into TaisyncTelemetry.exe.
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 39, 0, 0),
-    prodvers=(1, 39, 0, 0),
+    filevers=(1, 40, 0, 0),
+    prodvers=(1, 40, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,11 +17,11 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'Taysinc FPV'),
          StringStruct('FileDescription', 'Taisync Telemetry'),
-         StringStruct('FileVersion', '1.39.0.0'),
+         StringStruct('FileVersion', '1.40.0.0'),
          StringStruct('InternalName', 'TaisyncTelemetry'),
          StringStruct('OriginalFilename', 'TaisyncTelemetry.exe'),
          StringStruct('ProductName', 'Taisync Telemetry'),
-         StringStruct('ProductVersion', '1.39.0.0')])
+         StringStruct('ProductVersion', '1.40.0.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]

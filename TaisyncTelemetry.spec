@@ -12,7 +12,7 @@ the installer hides it from the user anyway.
 from PyInstaller.utils.hooks import collect_submodules
 
 APP_NAME = "TaisyncTelemetry"
-ENTRY = "fpv_telemetry_v1_39.py"
+ENTRY = "fpv_telemetry_v1_40.py"
 ICON = "fpv_telemetry_icon.ico"
 
 # Qt ships far more than this app uses; dropping these keeps the build to a
