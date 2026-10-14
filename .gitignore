@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+
+# Runtime data (now lives in %APPDATA%\TaisyncTelemetry, these are legacy paths)
+logs/
+ping_debug.log
+telemetry_settings.json
+
+# Build output
+build/
+dist/
+dist_zip/
+dist_installer/
